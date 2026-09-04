@@ -65,6 +65,43 @@ static const Color FLOOR_A = { 38, 38, 42, 255 };
 static const Color FLOOR_B = { 44, 44, 48, 255 };
 static const Color WALL_COL = { 70, 70, 78, 255 };
 
+#include "font_data.h"
+
+static Font PX_FONT;
+static int PX_OK = 0;
+
+/* bitmap pixel fonts only look right at integer scales: snap the requested
+ * size to a multiple of the font's base size */
+static float px_scale(int size)
+{
+    float scale = (float)size / (float)PX_FONT.baseSize;
+
+    if (scale < 1.0f) return 1.0f;
+    return floorf(scale + 0.3f);
+}
+
+static void px_text(const char *text, int x, int y, int size, Color color)
+{
+    float scale;
+
+    if (!PX_OK) {
+        DrawText(text, x, y, size, color);
+        return;
+    }
+    scale = px_scale(size);
+    DrawTextEx(PX_FONT, text, (Vector2){ (float)x, (float)y },
+               (float)PX_FONT.baseSize * scale, scale, color);
+}
+
+static int px_measure(const char *text, int size)
+{
+    float scale;
+
+    if (!PX_OK) return MeasureText(text, size);
+    scale = px_scale(size);
+    return (int)MeasureTextEx(PX_FONT, text, (float)PX_FONT.baseSize * scale, scale).x;
+}
+
 typedef struct {
     int used;
     char name[33];
@@ -152,12 +189,13 @@ typedef struct {
     int last_kind;                   /* dot-repeat: 0 none, 1 move, 2 melee */
     char last_motion[2];
     int last_count;
-    int cmd_open;                    /* vim-style ':' command line */
-    char cmd[128];
+    char cmd[128];                   /* console prompt line */
     char cmd_history[MAX_HISTORY][128];
     int hist_count;
     int hist_nav;                    /* -1 = typing live, else index back in history */
     char cmd_stash[128];             /* the live line while browsing history */
+    char comp_base[32];              /* tab completion: typed prefix + cycle index */
+    int comp_idx;
     int want_quit;
 
     Camera3D camera;
@@ -800,27 +838,57 @@ static void pump_network(app_t *app)
 
 static void cmd_start(app_t *app)
 {
-    app->cmd_open = 1;
+    app->console_open = 1;
+    app->console_scroll = 0;
     app->cmd[0] = '\0';
     app->count = 0;
     app->pending_z = 0;
+    app->pending_op = 0;
     app->hist_nav = -1;
+    app->comp_idx = -1;
 }
 
-static void cmd_history_push(app_t *app)
+static void history_push(app_t *app, const char *line)
 {
     int i;
 
-    if (app->cmd[0] == '\0') return;
-    if (app->hist_count > 0 && strcmp(app->cmd_history[app->hist_count - 1], app->cmd) == 0) return;
+    if (line[0] == '\0') return;
+    if (app->hist_count > 0 && strcmp(app->cmd_history[app->hist_count - 1], line) == 0) return;
 
     if (app->hist_count == MAX_HISTORY) {
         for (i = 1; i < MAX_HISTORY; i++) strcpy(app->cmd_history[i - 1], app->cmd_history[i]);
         app->hist_count--;
     }
-    snprintf(app->cmd_history[app->hist_count], sizeof(app->cmd_history[0]), "%s", app->cmd);
+    snprintf(app->cmd_history[app->hist_count], sizeof(app->cmd_history[0]), "%s", line);
     app->hist_count++;
     history_save(app);
+}
+
+static const char *COMMANDS[] = { "connect", "disconnect", "mute", "q", "setup" };
+#define COMMAND_COUNT 5
+
+/* tab cycles through commands matching the typed prefix */
+static void cmd_tab_complete(app_t *app)
+{
+    int matches[COMMAND_COUNT];
+    int found = 0;
+    int i;
+    size_t blen;
+
+    if (strchr(app->cmd, ' ') != NULL) return;    /* only the command word completes */
+
+    if (app->comp_idx == -1) snprintf(app->comp_base, sizeof(app->comp_base), "%s", app->cmd);
+    blen = strlen(app->comp_base);
+
+    for (i = 0; i < COMMAND_COUNT; i++) {
+        if (strncmp(COMMANDS[i], app->comp_base, blen) == 0) {
+            matches[found] = i;
+            found++;
+        }
+    }
+    if (found == 0) return;
+    app->comp_idx = (app->comp_idx + 1) % found;
+    snprintf(app->cmd, sizeof(app->cmd), "%s", COMMANDS[matches[app->comp_idx]]);
 }
 
 static void run_command(app_t *app)
@@ -858,23 +926,48 @@ static void run_command(app_t *app)
     } else if (cmd[0] != '\0') {
         snprintf(line, sizeof(line), "not a command: %s", cmd);
         snprintf(app->error, sizeof(app->error), "%s", line);
-        if (app->screen == SCREEN_WORLD) log_line(app, line);
+        log_line(app, line);
     }
 }
 
-static void update_command_mode(app_t *app)
+static void update_console(app_t *app)
 {
     int ch;
+    int ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+    int stored = app->event_total < MAX_EVENTS ? app->event_total : MAX_EVENTS;
     size_t len = strlen(app->cmd);
+    char echo[160];
 
     if (IsKeyPressed(KEY_ESCAPE)) {
-        app->cmd_open = 0;
+        app->console_open = 0;
         return;
     }
     if (IsKeyPressed(KEY_ENTER)) {
-        app->cmd_open = 0;
-        cmd_history_push(app);
+        app->console_open = 0;
+        if (app->cmd[0] != '\0') {
+            snprintf(echo, sizeof(echo), ":%s", app->cmd);
+            log_line(app, echo);
+        }
+        history_push(app, app->cmd);
         run_command(app);
+        return;
+    }
+
+    /* log scrolling: ctrl-u/ctrl-d or page up/down */
+    if (IsKeyPressed(KEY_PAGE_UP) || (ctrl && IsKeyPressed(KEY_U))) {
+        app->console_scroll += 5;
+        if (app->console_scroll > stored - 1) app->console_scroll = stored - 1;
+        if (app->console_scroll < 0) app->console_scroll = 0;
+        return;
+    }
+    if (IsKeyPressed(KEY_PAGE_DOWN) || (ctrl && IsKeyPressed(KEY_D))) {
+        app->console_scroll -= 5;
+        if (app->console_scroll < 0) app->console_scroll = 0;
+        return;
+    }
+
+    if (IsKeyPressed(KEY_TAB)) {
+        cmd_tab_complete(app);
         return;
     }
 
@@ -882,6 +975,7 @@ static void update_command_mode(app_t *app)
     if (IsKeyPressed(KEY_UP) && app->hist_nav < app->hist_count - 1) {
         if (app->hist_nav == -1) snprintf(app->cmd_stash, sizeof(app->cmd_stash), "%s", app->cmd);
         app->hist_nav++;
+        app->comp_idx = -1;
         snprintf(app->cmd, sizeof(app->cmd), "%s",
                  app->cmd_history[app->hist_count - 1 - app->hist_nav]);
         return;
@@ -898,20 +992,26 @@ static void update_command_mode(app_t *app)
     }
     if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
         if (len == 0) {
-            app->cmd_open = 0;    /* backspace on an empty cmdline leaves it, like vim */
+            app->console_open = 0;    /* backspace on an empty prompt closes, like vim */
             return;
         }
         app->cmd[len - 1] = '\0';
         len--;
+        app->comp_idx = -1;
     }
 
     for (;;) {
         ch = GetCharPressed();
         if (ch == 0) break;
+        if ((ch == '`' || ch == '~') && len == 0) {
+            app->console_open = 0;    /* ~ on an empty prompt toggles the console shut */
+            return;
+        }
         if (ch < 32 || ch > 126) continue;
         if (len + 1 >= sizeof(app->cmd)) continue;
         app->cmd[len++] = (char)ch;
         app->cmd[len] = '\0';
+        app->comp_idx = -1;
     }
 }
 
@@ -964,7 +1064,7 @@ static void update_home_screen(app_t *app)
     for (;;) {
         ch = GetCharPressed();
         if (ch == 0) break;
-        if (ch == ':') {
+        if (ch == ':' || ch == '~' || ch == '`') {
             cmd_start(app);
             return;
         }
@@ -1053,23 +1153,6 @@ static void update_world_screen(app_t *app)
 {
     int ch;
 
-    /* console eats all input while open */
-    if (app->console_open) {
-        int stored = app->event_total < MAX_EVENTS ? app->event_total : MAX_EVENTS;
-
-        for (;;) {
-            ch = GetCharPressed();
-            if (ch == 0) break;
-            if (ch == '`' || ch == '~') app->console_open = 0;
-            else if (ch == 'j' && app->console_scroll > 0) app->console_scroll--;
-            else if (ch == 'k') app->console_scroll++;
-        }
-        if (IsKeyPressed(KEY_ESCAPE)) app->console_open = 0;
-        if (app->console_scroll > stored - 1) app->console_scroll = stored - 1;
-        if (app->console_scroll < 0) app->console_scroll = 0;
-        return;
-    }
-
     if (IsKeyPressed(KEY_ESCAPE)) {
         app->count = 0;
         app->pending_z = 0;
@@ -1093,10 +1176,7 @@ static void update_world_screen(app_t *app)
                 app->defend_off_wanted = 1;
                 send_defend(app, 0);
                 sound_play(SND_GUARD_OFF);
-            } else if (ch == '`' || ch == '~') {
-                app->console_open = 1;
-                app->console_scroll = 0;
-            } else if (ch == ':') {
+            } else if (ch == '`' || ch == '~' || ch == ':') {
                 cmd_start(app);
                 return;
             }
@@ -1164,7 +1244,7 @@ static void update_world_screen(app_t *app)
         case 'K': do_move(app, 0, -1, "K", app->dash_mult); break;
         case 'L': do_move(app, 1, 0, "L", app->dash_mult); break;
         case '`':
-        case '~': app->console_open = 1; app->console_scroll = 0; break;
+        case '~': cmd_start(app); return;
         case 'x':
             app->defending = 1;
             app->defend_off_wanted = 0;
@@ -1214,9 +1294,9 @@ static void draw_field(int x, int y, const char *label, const char *value,
         snprintf(shown, sizeof(shown), "%s", value);
     }
 
-    DrawText(label, x, y, 20, DIM);
-    DrawText(shown, x + 130, y, 20, color);
-    if (focused) DrawText("_", x + 130 + MeasureText(shown, 20) + 2, y, 20, ACCENT);
+    px_text(label, x, y, 20, DIM);
+    px_text(shown, x + 130, y, 20, color);
+    if (focused) px_text("_", x + 130 + px_measure(shown, 20) + 2, y, 20, ACCENT);
 }
 
 static void draw_status_bar(app_t *app)
@@ -1225,12 +1305,6 @@ static void draw_status_bar(app_t *app)
     char count_str[16];
     const char *state = "offline";
 
-    if (app->cmd_open) {
-        snprintf(status, sizeof(status), ":%s", app->cmd);
-        DrawText(status, 10, GetScreenHeight() - 26, 18, FG);
-        DrawText("_", 10 + MeasureText(status, 18) + 2, GetScreenHeight() - 26, 18, ACCENT);
-        return;
-    }
 
     if (app->conn == CONN_SOCKET) state = "connecting";
     if (app->conn == CONN_HELLO_SENT) state = "handshake";
@@ -1246,12 +1320,12 @@ static void draw_status_bar(app_t *app)
         snprintf(status, sizeof(status), " %s | %d,%d | %.0fms",
                  mode, app->self_x, app->self_y, app->rtt_ms);
 
-        DrawText("hp", bx, by, 16, DIM);
+        px_text("hp", bx, by, 16, DIM);
         DrawRectangle(bx + 24, by + 4, 84, 8, (Color){ 50, 50, 50, 255 });
         if (app->hp_max > 0) {
             DrawRectangle(bx + 24, by + 4, (int)(84.0f * app->hp_shown / app->hp_max), 8, ACCENT);
         }
-        DrawText("st", bx + 122, by, 16, DIM);
+        px_text("st", bx + 122, by, 16, DIM);
         DrawRectangle(bx + 144, by + 4, 84, 8, (Color){ 50, 50, 50, 255 });
         if (app->stamina_max > 0) {
             DrawRectangle(bx + 144, by + 4, (int)(84.0f * app->stamina_shown / app->stamina_max), 8,
@@ -1264,7 +1338,7 @@ static void draw_status_bar(app_t *app)
     } else {
         snprintf(status, sizeof(status), " %s", state);
     }
-    DrawText(status, 10, GetScreenHeight() - 26, 18, DIM);
+    px_text(status, 10, GetScreenHeight() - 26, 18, DIM);
 
     if (app->screen == SCREEN_WORLD && (app->count > 0 || app->pending_op != 0)) {
         if (app->count > 0 && app->pending_op != 0) {
@@ -1274,20 +1348,20 @@ static void draw_status_bar(app_t *app)
         } else {
             snprintf(count_str, sizeof(count_str), "%d", app->count);
         }
-        DrawText(count_str, GetScreenWidth() - 80, GetScreenHeight() - 26, 18, ACCENT);
+        px_text(count_str, GetScreenWidth() - 80, GetScreenHeight() - 26, 18, ACCENT);
     }
 }
 
 static void draw_setup_screen(app_t *app)
 {
-    DrawText("gridmmo", 40, 40, 32, ACCENT);
-    DrawText("who are you? (first login on a server registers this identity)", 40, 80, 18, DIM);
+    px_text("gridmmo", 40, 40, 32, ACCENT);
+    px_text("who are you? (first login on a server registers this identity)", 40, 80, 18, DIM);
 
     draw_field(40, 140, "name", app->name, app->focus == 0, 0);
     draw_field(40, 175, "password", app->password, app->focus == 1, 1);
 
-    DrawText("tab to switch, enter to save", 40, 220, 18, DIM);
-    if (app->error[0] != '\0') DrawText(app->error, 40, 260, 20, ERRCOL);
+    px_text("tab to switch, enter to save", 40, 220, 18, DIM);
+    if (app->error[0] != '\0') px_text(app->error, 40, 260, 20, ERRCOL);
 }
 
 /* vim :intro style — a few dim centered lines on an otherwise empty screen */
@@ -1319,16 +1393,16 @@ static void draw_home_screen(app_t *app)
     for (i = 0; i < count; i++) {
         Color c = (i == 0) ? (Color){ 90, 120, 90, 255 } : DIM;
 
-        DrawText(lines[i], w / 2 - MeasureText(lines[i], sizes[i]) / 2, y, sizes[i], c);
+        px_text(lines[i], w / 2 - px_measure(lines[i], sizes[i]) / 2, y, sizes[i], c);
         y += sizes[i] + 12;
     }
 
     if (app->conn == CONN_SOCKET || app->conn == CONN_HELLO_SENT || app->conn == CONN_AUTH_SENT) {
         const char *note = "connecting...";
-        DrawText(note, w / 2 - MeasureText(note, 18) / 2, y + 10, 18, FG);
+        px_text(note, w / 2 - px_measure(note, 18) / 2, y + 10, 18, FG);
     }
     if (app->error[0] != '\0') {
-        DrawText(app->error, w / 2 - MeasureText(app->error, 18) / 2, y + 40, 18, ERRCOL);
+        px_text(app->error, w / 2 - px_measure(app->error, 18) / 2, y + 40, 18, ERRCOL);
     }
 }
 
@@ -1400,18 +1474,18 @@ static void draw_text_outlined(const char *text, int x, int y, int size, Color c
 {
     Color shadow = { 0, 0, 0, color.a };
 
-    DrawText(text, x - 1, y, size, shadow);
-    DrawText(text, x + 1, y, size, shadow);
-    DrawText(text, x, y - 1, size, shadow);
-    DrawText(text, x, y + 1, size, shadow);
-    DrawText(text, x, y, size, color);
+    px_text(text, x - 1, y, size, shadow);
+    px_text(text, x + 1, y, size, shadow);
+    px_text(text, x, y - 1, size, shadow);
+    px_text(text, x, y + 1, size, shadow);
+    px_text(text, x, y, size, color);
 }
 
 static void draw_name_tag(app_t *app, const char *name, float wx, float wy, Color color)
 {
     Vector3 above = { wx, 1.35f, wy };
     Vector2 screen = GetWorldToScreen(above, app->camera);
-    int width = MeasureText(name, 18);
+    int width = px_measure(name, 18);
 
     draw_text_outlined(name, (int)screen.x - width / 2, (int)screen.y, 18, color);
 }
@@ -1659,7 +1733,7 @@ static void draw_world_screen(app_t *app)
 
         /* pop bigger in the first moment, then settle; fade over the last half */
         size = (life < 0.15f) ? (int)(30 + (0.15f - life) * 160.0f) : 30;
-        width = MeasureText(text, size);
+        width = px_measure(text, size);
         col = (Color){ 255, 90, 70, 255 };
         if (life > 0.5f) col.a = (unsigned char)(255 * (1.0f - (life - 0.5f) / 0.5f));
         draw_text_outlined(text, (int)screen.x - width / 2, (int)screen.y, size, col);
@@ -1698,14 +1772,17 @@ static void draw_console(app_t *app)
     int w = GetScreenWidth();
     int h = GetScreenHeight() / 2;
     int stored = app->event_total < MAX_EVENTS ? app->event_total : MAX_EVENTS;
-    int rows = (h - 40) / 20;
+    int rows = (h - 64) / 20;
     int i;
+
+    char prompt[160];
 
     DrawRectangle(0, 0, w, h, (Color){ 12, 12, 16, 235 });
     DrawRectangle(0, h, w, 2, (Color){ 90, 90, 110, 255 });
-    DrawText("console — events (~ to close, j/k to scroll)", 12, 10, 16, DIM);
+    px_text("console — enter runs, esc closes, up/down history, ctrl-u/d scroll",
+             12, 10, 16, DIM);
 
-    /* newest at the bottom, like a terminal; console_scroll pages upward */
+    /* newest just above the prompt; console_scroll pages upward */
     for (i = 0; i < rows && i < stored; i++) {
         int idx = i + app->console_scroll;    /* 0 = newest */
         int slot;
@@ -1713,9 +1790,15 @@ static void draw_console(app_t *app)
 
         if (idx >= stored) break;
         slot = ((app->event_head - 1 - idx) % MAX_EVENTS + MAX_EVENTS) % MAX_EVENTS;
-        y = h - 28 - i * 20;
-        DrawText(app->events[slot], 12, y, 16, (Color){ 210, 210, 210, 255 });
+        y = h - 52 - i * 20;
+        px_text(app->events[slot], 12, y, 16, (Color){ 210, 210, 210, 255 });
     }
+
+    /* the prompt line */
+    DrawRectangle(0, h - 28, w, 26, (Color){ 20, 20, 26, 255 });
+    snprintf(prompt, sizeof(prompt), ":%s", app->cmd);
+    px_text(prompt, 12, h - 24, 18, FG);
+    px_text("_", 12 + px_measure(prompt, 18) + 2, h - 24, 18, ACCENT);
 }
 
 int main(void)
@@ -1728,9 +1811,17 @@ int main(void)
     app.conn = CONN_IDLE;
     app.hist_nav = -1;
     snprintf(app.address, sizeof(app.address), DEFAULT_ADDRESS);
+    app.comp_idx = -1;
     if (config_load(&app)) app.screen = SCREEN_HOME;
     else app.screen = SCREEN_SETUP;
     history_load(&app);
+    if (app.screen == SCREEN_HOME) {
+        char seed[160];
+
+        /* even on a fresh install, up-arrow recalls the last server */
+        snprintf(seed, sizeof(seed), "connect %s", app.address);
+        history_push(&app, seed);
+    }
 
     app.cam_dist = 14.0f;
     app.camera.up = (Vector3){ 0.0f, 1.0f, 0.0f };
@@ -1742,13 +1833,30 @@ int main(void)
     SetTargetFPS(60);
     SetExitKey(KEY_NULL);
     sound_init();
+    {
+        /* rasterize at the font's native 16px grid, thresholded (no AA) */
+        GlyphInfo *glyphs = LoadFontData(FONT_TTF, FONT_TTF_LEN, 16, NULL, 95, FONT_BITMAP);
 
+        if (glyphs != NULL) {
+            Rectangle *recs = NULL;
+            Image atlas = GenImageFontAtlas(glyphs, &recs, 95, 16, 2, 0);
+
+            PX_FONT.baseSize = 16;
+            PX_FONT.glyphCount = 95;
+            PX_FONT.glyphPadding = 2;
+            PX_FONT.glyphs = glyphs;
+            PX_FONT.recs = recs;
+            PX_FONT.texture = LoadTextureFromImage(atlas);
+            UnloadImage(atlas);
+            if (PX_FONT.texture.id != 0) PX_OK = 1;
+        }
+    }
 
     while (!WindowShouldClose() && !app.want_quit) {
         pump_network(&app);
 
-        if (app.cmd_open) {
-            update_command_mode(&app);
+        if (app.console_open) {
+            update_console(&app);
         } else {
             switch (app.screen) {
             case SCREEN_SETUP: update_setup_screen(&app); break;
@@ -1764,12 +1872,13 @@ int main(void)
         case SCREEN_HOME: draw_home_screen(&app); break;
         case SCREEN_WORLD: draw_world_screen(&app); break;
         }
-        if (app.screen == SCREEN_WORLD && app.console_open) draw_console(&app);
+        if (app.console_open) draw_console(&app);
         draw_status_bar(&app);
         EndDrawing();
     }
 
     if (app.ws.state != WS_CLOSED) ws_close(&app.ws);
+    if (PX_OK) UnloadFont(PX_FONT);
     sound_shutdown();
     CloseWindow();
     return 0;

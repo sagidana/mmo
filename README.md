@@ -82,8 +82,7 @@ esc            clear pending count / operator
 zz / zZ        center screen vertically / both axes
 zh zl zk zj    view the area left / right / above / below
 + / -          zoom
-~              toggle event console
-:              command mode
+: or ~         open the console (event log + command prompt)
 ```
 
 ## Commands
@@ -95,8 +94,10 @@ zh zl zk zj    view the area left / right / above / below
 :setup                change the saved name/password
 :mute                 toggle sound
 
-Arrow up/down in command mode walks the command history
-(persisted in gridmmo.hist).
+Commands run from the console prompt (`:` or `~` opens it): enter runs,
+esc closes, tab completes/cycles command names, arrow up/down walks
+history (persisted in gridmmo.hist; seeded with the last server so
+up-arrow always recalls it), ctrl-u/d scrolls the event log.
 
 ```
 
