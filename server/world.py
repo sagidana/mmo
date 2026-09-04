@@ -12,6 +12,17 @@ MOTIONS['l'] = (1, 0)
 MOTIONS['k'] = (0, -1)
 MOTIONS['j'] = (0, 1)
 
+# dash motions: same directions, capital keys, multi-tile step
+DASH_MOTIONS = {}
+DASH_MOTIONS['H'] = (-1, 0)
+DASH_MOTIONS['L'] = (1, 0)
+DASH_MOTIONS['K'] = (0, -1)
+DASH_MOTIONS['J'] = (0, 1)
+
+MOVE_DIRS = {}
+MOVE_DIRS.update(MOTIONS)
+MOVE_DIRS.update(DASH_MOTIONS)
+
 
 class World():
     def __init__(self, map_path):
@@ -59,7 +70,7 @@ class World():
         return flat
 
     def resolve_move(self, x, y, motion, count, occupied):
-        dx, dy = MOTIONS[motion]
+        dx, dy = MOVE_DIRS[motion]
         granted = 0
         while granted < count:
             nx = x + dx
@@ -70,6 +81,18 @@ class World():
             y = ny
             granted += 1
         return granted, x, y
+
+    def ray_targets(self, x, y, motion, reach, occupied):
+        # entities on the melee ray, nearest first, as (key, distance) pairs;
+        # the ray cares only about entities, not walls (draft semantics)
+        dx, dy = MOTIONS[motion]
+        targets = []
+        distance = 1
+        while distance <= reach:
+            pos = (x + dx * distance, y + dy * distance)
+            if pos in occupied: targets.append((occupied[pos], distance))
+            distance += 1
+        return targets
 
     def find_free_near(self, x, y, occupied):
         # breadth-first from the desired tile to the nearest free one

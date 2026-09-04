@@ -17,7 +17,8 @@ python3 -m server.main --host 0.0.0.0 --port 4000 --db gridmmo.db --map server/m
 
 State lives in one SQLite file (`--db`). First login with a new name
 registers it. The map is an ASCII file (`.` floor, `#` wall, `S` spawn) —
-edit it in vim, restart the server.
+edit it in vim, restart the server. Training NPCs spawn near `S` by default
+(dummies to hit, a wanderer); `--no-npcs` disables them.
 
 ## Client
 
@@ -33,6 +34,20 @@ make client RAYLIB_DIR=~/raylib-5.5_linux_amd64   # or a release dir
 
 Type the server address (`host:port`), enter, then name + password.
 First login registers the name. The lobby shows who is online.
+
+### Windows build (for friends)
+
+Cross-compiled from linux; produces a single static `gridmmo.exe` with no
+dependencies — just send the file:
+
+```
+make windows WINCC=<llvm-mingw>/bin/x86_64-w64-mingw32-gcc \
+             RAYLIB_WIN_DIR=<raylib-5.5_win64_mingw-w64>
+```
+
+Toolchain: https://github.com/mstorsjo/llvm-mingw (ucrt ubuntu release) and
+raylib's `win64_mingw-w64` release zip. SmartScreen will warn on first run
+(unsigned exe) — "More info" -> "Run anyway".
 
 `make test_cli` builds a headless protocol exerciser (no raylib needed):
 
@@ -55,11 +70,15 @@ client/        C raylib client
 ## Keys (world)
 
 ```
-h j k l        move (count prefix works: 12j)
-esc            clear pending count
+h j k l        move (count prefix works: 12j), costs stamina
+H J K L        dash (4 tiles per press: shift + move)
+d{motion}      melee attack (count = damage pool: 5dl)
+.              repeat last melee
+esc            clear pending count / operator
 zz / zZ        center screen vertically / both axes
 zh zl zk zj    view the area left / right / above / below
 + / -          zoom
+~              toggle event console
 :              command mode
 ```
 
@@ -79,4 +98,6 @@ zh zl zk zj    view the area left / right / above / below
 2. **done** — grid world: ASCII map, `intent` movement (`{op, motion,
    count}`), collision (walls + players), 20Hz tick-batched `state` deltas,
    optimistic echo, position persistence, 3D block rendering.
-3. next — the operator grammar: melee (`3dl`), stamina, dashes, health.
+3. **done** — combat: stamina economy, melee (`5dl` draft pool semantics),
+   health/damage/death/respawn, training NPCs, hp bars + hit flashes.
+4. next — dashes (`w`/`b`), `dd` (attack last opponent), then magic/defence.

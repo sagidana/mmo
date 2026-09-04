@@ -24,13 +24,16 @@ test_cli: test_cli.c $(COMMON)
 # needs a mingw-w64 toolchain (WINCC) and a raylib win64_mingw-w64 release dir:
 #   make windows WINCC=x86_64-w64-mingw32-gcc RAYLIB_WIN_DIR=~/raylib-5.5_win64_mingw-w64
 WINCC ?= x86_64-w64-mingw32-gcc
+WINDRES ?= $(dir $(WINCC))x86_64-w64-mingw32-windres
 
-windows: main.c $(COMMON)
-	$(WINCC) $(CFLAGS) -I$(RAYLIB_WIN_DIR)/include -o gridmmo.exe $^ \
+windows: main.c $(COMMON) gridmmo.rc
+	$(WINDRES) gridmmo.rc gridmmo_rc.o
+	$(WINCC) $(CFLAGS) -I$(RAYLIB_WIN_DIR)/include -o gridmmo.exe \
+	    main.c $(COMMON) gridmmo_rc.o \
 	    $(RAYLIB_WIN_DIR)/lib/libraylib.a \
-	    -lws2_32 -lwinmm -lgdi32 -lopengl32 -static -mwindows
+	    -lws2_32 -lwinmm -lgdi32 -lopengl32 -mwindows
 
 clean:
-	rm -f client test_cli gridmmo.exe
+	rm -f client test_cli gridmmo.exe gridmmo_rc.o
 
 .PHONY: windows clean

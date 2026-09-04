@@ -32,6 +32,13 @@ class Db():
             self.conn.commit()
         except sqlite3.OperationalError:
             pass
+        # layer 3: vitals (NULL = full)
+        try:
+            self.conn.execute("ALTER TABLE players ADD COLUMN hp REAL")
+            self.conn.execute("ALTER TABLE players ADD COLUMN stamina REAL")
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass
 
     def close(self):
         self.conn.close()
@@ -58,8 +65,9 @@ class Db():
         self.conn.execute("UPDATE players SET settings = ? WHERE id = ?", (settings_json, player_id))
         self.conn.commit()
 
-    def set_position(self, player_id, x, y):
-        self.conn.execute("UPDATE players SET x = ?, y = ? WHERE id = ?", (x, y, player_id))
+    def set_state(self, player_id, x, y, hp, stamina):
+        self.conn.execute("UPDATE players SET x = ?, y = ?, hp = ?, stamina = ? WHERE id = ?",
+                          (x, y, hp, stamina, player_id))
         self.conn.commit()
 
     def touch_last_seen(self, player_id):

@@ -1,0 +1,13 @@
+# python
+__pycache__/
+*.pyc
+
+# build artifacts
+*.o
+/client/client
+/client/test_cli
+
+# runtime state
+*.db
+
+# keep client/gridmmo.exe tracked: it is the deliverable handed to friends

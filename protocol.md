@@ -147,8 +147,9 @@ c->s  {"type": "intent", "seq": 9, "data": {"op": "move", "motion": "j", "count"
 s->c  {"type": "intent_ok", "seq": 9, "data": {"granted": 2, "x": 4, "y": 9}}
 ```
 
-- `op`: `move` (layer 2). Reserved: melee, magic, defend, grab, talk, action.
-- `motion`: `h` `j` `k` `l` (layer 2). Reserved: w b H J K L ...
+- `op`: `move`, `melee`. Reserved: magic, defend, grab, talk, action.
+- `motion`: move accepts `h j k l` and dash `H J K L` (capitals = a
+  `dash_mult`-tile step in that direction); melee accepts `h j k l` only.
 - `count` is *requested*, 1..4096; `granted` is what the world allowed.
   Movement is one atomic hop: `granted = min(count, free tiles until
   wall/player/map edge)`. `granted: 0` (against a wall) is a normal reply,
@@ -158,6 +159,59 @@ s->c  {"type": "intent_ok", "seq": 9, "data": {"granted": 2, "x": 4, "y": 9}}
   login spawns at `S`, an occupied spawn resolves to the nearest free tile.
 - No rate limit on `move` in this layer; stamina becomes the natural
   limiter in a later layer.
+
+# Protocol — Layer 3: combat
+
+## rules (in welcome)
+
+Server tuning shipped to the client, which simulates regen locally between
+authoritative checkpoints (every `intent_ok`, `vitals` and `state` hp entry
+snaps the simulation straight). The wire is silent while bars refill.
+
+```
+"rules": {"hp_max": 100, "stamina_max": 100, "hp_regen": 1.0,
+          "stamina_regen": 8.0, "move_cost": 1, "melee_cost": 2, "dash_mult": 4}
+```
+
+## costs
+
+- `move`: 1 stamina per granted tile; granted also caps at what is affordable.
+- `melee`: `granted = min(count, floor(stamina / melee_cost))` pool points,
+  committed on the swing — whiffs cost full stamina.
+
+`intent_ok` now always carries vitals:
+
+```
+s->c  {"type": "intent_ok", "seq": 9, "data": {"granted": 5, "x": 4, "y": 7,
+                                               "hp": 100, "stamina": 88.4}}
+```
+
+## melee resolution (draft pool semantics)
+
+The pool travels the motion line (entities only; walls do not stop it):
+each gap beyond adjacent costs `distance - 1` pool; the first entity absorbs
+pool capped at its health; leftover pierces only through kills.
+
+## events
+
+```
+{"type": "melee",  "data": {"by": "dana", "motion": "l", "count": 5, "x": 4, "y": 7}}
+{"type": "died",   "data": {"name": "sagi", "by": "dana"}}
+{"type": "vitals", "data": {"hp": 93.0, "stamina": 70.0}}            <- to the victim
+{"type": "vitals", "data": {"hp": 100, "stamina": 100, "x": 10, "y": 8}}  <- respawn (position included)
+```
+
+`melee` is broadcast to everyone but the attacker (who animates its own
+swing optimistically). `state` delta entries gain optional `"hp"`/`"hp_max"`
+when a player was hurt. Death refills both bars and respawns at `S`
+(players) or at the entity's home (npcs).
+
+## npcs
+
+Server-side entities living in the same session registry: they appear in
+`online`, `state`, and are valid melee targets; they send nothing. Started
+by default, disabled with `--no-npcs`. Current set: `dummy_1..3` (30 hp,
+static, in a row near spawn) and `walker` (60 hp, wanders).
 
 ## Wire format evolution
 
