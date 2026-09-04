@@ -147,7 +147,13 @@ c->s  {"type": "intent", "seq": 9, "data": {"op": "move", "motion": "j", "count"
 s->c  {"type": "intent_ok", "seq": 9, "data": {"granted": 2, "x": 4, "y": 9}}
 ```
 
-- `op`: `move`, `melee`. Reserved: magic, defend, grab, talk, action.
+- `op`: `move`, `melee`, `defend` (motion `on`/`off`; while defending, move
+  and melee grant 0; stamina drains at `defend_drain`/s and regen pauses; a
+  shield soaks the whole remaining melee pool — blocked points cost 1
+  stamina each, the uncovered rest hits hp and breaks the guard; guard
+  auto-breaks at 0 stamina; `defend` events `{"name", "on"}` broadcast to
+  everyone, and full snapshots mark defenders with `"def": 1`).
+  Reserved: magic, grab, talk, action.
 - `motion`: move accepts `h j k l` and dash `H J K L` (capitals = a
   `dash_mult`-tile step in that direction); melee accepts `h j k l` only.
 - `count` is *requested*, 1..4096; `granted` is what the world allowed.

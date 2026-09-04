@@ -11,3 +11,7 @@ __pycache__/
 *.db
 
 # keep client/gridmmo.exe tracked: it is the deliverable handed to friends
+
+# client runtime state
+gridmmo.cfg
+gridmmo.hist

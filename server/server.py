@@ -32,6 +32,7 @@ RULES['stamina_regen'] = 8.0
 RULES['move_cost'] = 1
 RULES['melee_cost'] = 2
 RULES['dash_mult'] = 4
+RULES['defend_drain'] = 6.0
 
 
 class Session():
@@ -49,6 +50,7 @@ class Session():
         self.stamina = RULES['stamina_max']
         self.is_npc = False
         self.dead = False
+        self.defending = False
         self.home = None
 
     def vitals(self):
@@ -91,6 +93,7 @@ class Npc():
         self.state = AUTHED
         self.is_npc = True
         self.dead = False
+        self.defending = False
         self.respawn_at = 0.0
         self.home = (x, y)
         self.wander = wander
@@ -316,6 +319,7 @@ class Server():
             entry['y'] = other.y
             entry['hp'] = round(other.hp, 1)
             entry['hp_max'] = other.hp_max
+            if other.defending: entry['def'] = 1
             snapshot.append(entry)
         state_data = {}
         state_data['full'] = True
@@ -368,6 +372,10 @@ class Server():
         session.send(protocol.reply('intent_ok', seq, reply_data))
 
     def do_move(self, session, seq, motion, count):
+        if session.defending:
+            self.intent_reply(session, seq, 0)
+            return
+
         tiles = count
         if motion in DASH_MOTIONS: tiles = count * RULES['dash_mult']
 
@@ -402,6 +410,21 @@ class Server():
         vitals_data['y'] = session.y
         session.send(protocol.event('vitals', vitals_data))
 
+    def set_defending(self, session, on):
+        if session.defending == on: return
+        session.defending = on
+        defend_data = {}
+        defend_data['name'] = session.name
+        defend_data['on'] = on
+        self.broadcast(protocol.event('defend', defend_data))
+
+    def do_defend(self, session, seq, motion):
+        if motion == 'on':
+            self.set_defending(session, True)
+        else:
+            self.set_defending(session, False)
+        self.intent_reply(session, seq, 1)
+
     def npc_die(self, npc):
         # vanish from the world; the ticker revives it after a delay
         npc.dead = True
@@ -425,6 +448,10 @@ class Server():
             self.mark_hurt(npc)
 
     def do_melee(self, session, seq, motion, count):
+        if session.defending:
+            self.intent_reply(session, seq, 0)
+            return
+
         affordable = int(session.stamina // RULES['melee_cost'])
         pool = min(count, affordable)
         if pool <= 0:
@@ -451,9 +478,19 @@ class Server():
             prev_distance = distance
             if consumed <= 0: break
 
-            damage = min(consumed, other.hp)
-            consumed -= damage
-            other.hp -= damage
+            if other.defending:
+                # a shield soaks the whole remaining pool: blocked points cost
+                # 1 stamina each, the uncovered rest hits hp and breaks the guard
+                blocked = min(consumed, other.stamina)
+                other.stamina -= blocked
+                damage = consumed - blocked
+                consumed = 0
+                other.hp -= damage
+                if damage > 0 or other.stamina <= 0: self.set_defending(other, False)
+            else:
+                damage = min(consumed, other.hp)
+                consumed -= damage
+                other.hp -= damage
 
             if other.hp <= 0:
                 died_data = {}
@@ -477,11 +514,18 @@ class Server():
             return
 
         op = data.get('op')
-        if op != 'move' and op != 'melee':
+        if op != 'move' and op != 'melee' and op != 'defend':
             session.send(protocol.error(seq, 'bad_request', f"unknown op: {op}"))
             return
 
         motion = data.get('motion')
+        if op == 'defend':
+            if motion != 'on' and motion != 'off':
+                session.send(protocol.error(seq, 'bad_request', "defend motion must be on/off"))
+                return
+            self.do_defend(session, seq, motion)
+            return
+
         allowed = MOVE_DIRS if op == 'move' else MOTIONS
         if motion not in allowed:
             session.send(protocol.error(seq, 'bad_request', f"bad motion for {op}: {motion}"))
@@ -544,14 +588,23 @@ class Server():
             self.cleanup(session)
 
     def regen(self):
+        broke = []
         for name in self.sessions:
             session = self.sessions[name]
             if session.is_npc: continue    # combat targets do not heal
             if session.hp < session.hp_max:
                 session.hp = min(session.hp_max, session.hp + RULES['hp_regen'] * TICK_INTERVAL)
+            if session.defending:
+                session.stamina -= RULES['defend_drain'] * TICK_INTERVAL
+                if session.stamina <= 0:
+                    session.stamina = 0
+                    broke.append(session)
+                continue
             if session.stamina < RULES['stamina_max']:
                 session.stamina = min(RULES['stamina_max'],
                                       session.stamina + RULES['stamina_regen'] * TICK_INTERVAL)
+        for session in broke:
+            self.set_defending(session, False)
 
     async def ticker(self):
         while True:

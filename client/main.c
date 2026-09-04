@@ -8,6 +8,7 @@
 
 #include "ws.h"
 #include "protocol.h"
+#include "sound.h"
 
 #define MAX_PLAYERS 128
 #define MAX_LOG 8
@@ -42,6 +43,7 @@ enum {
 
 #define MAX_HISTORY 32
 #define CONFIG_FILE "gridmmo.cfg"
+#define HISTORY_FILE "gridmmo.hist"
 #define DEFAULT_ADDRESS "142.132.187.130:4000"
 
 enum {
@@ -74,6 +76,7 @@ typedef struct {
     float hp_max;
     float hp_shown;        /* eases toward hp so damage visibly drains */
     double hit_time;
+    int defending;
 } player_t;
 
 typedef struct {
@@ -137,6 +140,9 @@ typedef struct {
     int move_cost;
     int melee_cost;
     int dash_mult;
+    float defend_drain;
+    int defending;
+    int defend_off_wanted;           /* we asked to lower the guard (vs. it broke) */
     double self_hit_time;
 
     /* input */
@@ -222,6 +228,32 @@ static void config_save(app_t *app)
     fclose(f);
 }
 
+/* command history survives restarts, viminfo-style */
+static void history_load(app_t *app)
+{
+    FILE *f = fopen(HISTORY_FILE, "r");
+    char line[128];
+
+    if (f == NULL) return;
+    while (fgets(line, sizeof(line), f) != NULL && app->hist_count < MAX_HISTORY) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0') continue;
+        snprintf(app->cmd_history[app->hist_count], sizeof(app->cmd_history[0]), "%s", line);
+        app->hist_count++;
+    }
+    fclose(f);
+}
+
+static void history_save(app_t *app)
+{
+    FILE *f = fopen(HISTORY_FILE, "w");
+    int i;
+
+    if (f == NULL) return;
+    for (i = 0; i < app->hist_count; i++) fprintf(f, "%s\n", app->cmd_history[i]);
+    fclose(f);
+}
+
 static player_t *player_find(app_t *app, const char *name)
 {
     int i;
@@ -257,6 +289,7 @@ static void player_upsert(app_t *app, const char *name, int x, int y)
         p->hp_max = 0;
         p->hp_shown = 0;
         p->hit_time = 0;
+        p->defending = 0;
         return;
     }
     trail_add_path(app, p->x, p->y, x, y, TRAIL_COLD);
@@ -339,6 +372,7 @@ static void dmg_add(app_t *app, float wx, float wy, int amount)
     d->wy = wy;
     d->amount = amount;
     d->born = (float)GetTime();
+    sound_play(SND_HIT);
 }
 
 /* melee swing: streak along the ray, including the far tile */
@@ -410,6 +444,8 @@ static void disconnect(app_t *app, const char *why)
     app->pending_z = 0;
     app->pending_op = 0;
     app->last_kind = 0;
+    app->defending = 0;
+    app->defend_off_wanted = 0;
     app->self_hit_time = 0;
     free(app->tiles);
     app->tiles = NULL;
@@ -541,6 +577,10 @@ static void handle_state(app_t *app, proto_msg_t *msg)
         }
         player_upsert(app, name->valuestring, (int)x->valuedouble, (int)y->valuedouble);
         p = player_find(app, name->valuestring);
+        if (p != NULL) {
+            cJSON *def = cJSON_GetObjectItem(entry, "def");
+            if (cJSON_IsNumber(def)) p->defending = (int)def->valuedouble;
+        }
         if (p != NULL && cJSON_IsNumber(hp)) {
             float new_hp = (float)hp->valuedouble;
 
@@ -593,6 +633,7 @@ static void handle_message(app_t *app, const char *raw)
         app->move_cost = 1;
         app->melee_cost = 2;
         app->dash_mult = 4;
+        app->defend_drain = 6.0f;
         if (rules != NULL) {
             cJSON *item = cJSON_GetObjectItem(rules, "hp_max");
             if (cJSON_IsNumber(item)) app->hp_max = (float)item->valuedouble;
@@ -608,6 +649,8 @@ static void handle_message(app_t *app, const char *raw)
             if (cJSON_IsNumber(item)) app->melee_cost = (int)item->valuedouble;
             item = cJSON_GetObjectItem(rules, "dash_mult");
             if (cJSON_IsNumber(item)) app->dash_mult = (int)item->valuedouble;
+            item = cJSON_GetObjectItem(rules, "defend_drain");
+            if (cJSON_IsNumber(item)) app->defend_drain = (float)item->valuedouble;
         }
         app->hp = app->hp_max;
         app->stamina = app->stamina_max;
@@ -649,17 +692,44 @@ static void handle_message(app_t *app, const char *raw)
             app->outstanding = 0;
         }
     } else if (strcmp(msg.type, "melee") == 0) {
+        sound_play(SND_SWING);
         trail_add_attack(app,
                          (int)proto_data_num(&msg, "x", 0),
                          (int)proto_data_num(&msg, "y", 0),
                          proto_data_str(&msg, "motion", "l"),
                          (int)proto_data_num(&msg, "count", 1));
+    } else if (strcmp(msg.type, "defend") == 0) {
+        const char *who = proto_data_str(&msg, "name", "?");
+        int on = 0;
+        cJSON *flag = NULL;
+
+        if (msg.data != NULL) flag = cJSON_GetObjectItem(msg.data, "on");
+        if (cJSON_IsTrue(flag)) on = 1;
+
+        if (strcmp(who, app->name) == 0) {
+            if (!on && app->defending && !app->defend_off_wanted) {
+                log_line(app, "your guard broke");
+                sound_play(SND_GUARD_BREAK);
+            }
+            app->defending = on;
+            if (!on) app->defend_off_wanted = 0;
+        } else {
+            player_t *p = player_find(app, who);
+            if (p != NULL) {
+                if (p->defending && !on) sound_play(SND_GUARD_OFF);
+                if (!p->defending && on) sound_play(SND_GUARD_ON);
+                p->defending = on;
+            }
+        }
     } else if (strcmp(msg.type, "died") == 0) {
         const char *victim = proto_data_str(&msg, "name", "?");
         player_t *p = player_find(app, victim);
 
         if (p != NULL) trail_add_burst(app, p->rx, p->ry);
         else if (strcmp(victim, app->name) == 0) trail_add_burst(app, app->self_rx, app->self_ry);
+
+        if (strcmp(victim, app->name) == 0) sound_play(SND_DEATH);
+        else sound_play(SND_KILL);
 
         snprintf(line, sizeof(line), "%s was slain by %s", victim, proto_data_str(&msg, "by", "?"));
         log_line(app, line);
@@ -750,6 +820,7 @@ static void cmd_history_push(app_t *app)
     }
     snprintf(app->cmd_history[app->hist_count], sizeof(app->cmd_history[0]), "%s", app->cmd);
     app->hist_count++;
+    history_save(app);
 }
 
 static void run_command(app_t *app)
@@ -773,6 +844,12 @@ static void run_command(app_t *app)
         if (arg != NULL) snprintf(app->address, sizeof(app->address), "%s", arg);
         if (app->conn != CONN_IDLE) disconnect(app, NULL);
         start_connect(app);
+    } else if (strcmp(cmd, "mute") == 0) {
+        sound_toggle_mute();
+        if (app->screen == SCREEN_WORLD) {
+            if (sound_muted()) log_line(app, "sound off");
+            else log_line(app, "sound on");
+        }
     } else if (strcmp(cmd, "setup") == 0) {
         if (app->conn != CONN_IDLE) disconnect(app, NULL);
         app->error[0] = '\0';
@@ -926,6 +1003,7 @@ static void do_move(app_t *app, int dx, int dy, const char *motion, int mult)
 
     granted = local_resolve_move(app, dx, dy, tiles, &x, &y);
     if (granted > 0) {
+        sound_play(SND_STEP);
         trail_add_path(app, app->self_x, app->self_y, x, y, TRAIL_WARM);
         app->self_x = x;
         app->self_y = y;
@@ -953,6 +1031,7 @@ static void do_melee(app_t *app, const char *motion)
         if (pool > affordable) pool = affordable;
     }
     if (pool > 0) {
+        sound_play(SND_SWING);
         trail_add_attack(app, app->self_x, app->self_y, motion, pool);
         app->stamina -= (float)(pool * app->melee_cost);
         if (app->stamina < 0) app->stamina = 0;
@@ -961,6 +1040,13 @@ static void do_melee(app_t *app, const char *motion)
     app->seq++;
     app->outstanding++;
     send_raw(app, proto_intent(app->seq, "melee", motion, count));
+}
+
+static void send_defend(app_t *app, int on)
+{
+    app->seq++;
+    app->outstanding++;
+    send_raw(app, proto_intent(app->seq, "defend", on ? "on" : "off", 1));
 }
 
 static void update_world_screen(app_t *app)
@@ -988,11 +1074,34 @@ static void update_world_screen(app_t *app)
         app->count = 0;
         app->pending_z = 0;
         app->pending_op = 0;
+        if (app->defending) {
+            app->defending = 0;
+            app->defend_off_wanted = 1;
+            send_defend(app, 0);
+            sound_play(SND_GUARD_OFF);
+        }
     }
 
     for (;;) {
         ch = GetCharPressed();
         if (ch == 0) break;
+
+        /* guard up: only x (release), esc, ~ and : work */
+        if (app->defending) {
+            if (ch == 'x') {
+                app->defending = 0;
+                app->defend_off_wanted = 1;
+                send_defend(app, 0);
+                sound_play(SND_GUARD_OFF);
+            } else if (ch == '`' || ch == '~') {
+                app->console_open = 1;
+                app->console_scroll = 0;
+            } else if (ch == ':') {
+                cmd_start(app);
+                return;
+            }
+            continue;
+        }
 
         if (app->pending_op == 'd') {
             app->pending_op = 0;
@@ -1056,6 +1165,13 @@ static void update_world_screen(app_t *app)
         case 'L': do_move(app, 1, 0, "L", app->dash_mult); break;
         case '`':
         case '~': app->console_open = 1; app->console_scroll = 0; break;
+        case 'x':
+            app->defending = 1;
+            app->defend_off_wanted = 0;
+            app->count = 0;
+            send_defend(app, 1);
+            sound_play(SND_GUARD_ON);
+            break;
         case 'z': app->pending_z = 1; break;
         case 'd': app->pending_op = 'd'; break;
         case '.':                                          /* repeat last melee */
@@ -1125,8 +1241,10 @@ static void draw_status_bar(app_t *app)
         int bx = GetScreenWidth() - 340;
         int by = GetScreenHeight() - 24;
 
-        snprintf(status, sizeof(status), " NORMAL | %d,%d | %.0fms",
-                 app->self_x, app->self_y, app->rtt_ms);
+        const char *mode = app->defending ? "DEFEND" : "NORMAL";
+
+        snprintf(status, sizeof(status), " %s | %d,%d | %.0fms",
+                 mode, app->self_x, app->self_y, app->rtt_ms);
 
         DrawText("hp", bx, by, 16, DIM);
         DrawRectangle(bx + 24, by + 4, 84, 8, (Color){ 50, 50, 50, 255 });
@@ -1308,7 +1426,12 @@ static void draw_world_screen(app_t *app)
      * others' hp is not simulated (npcs don't heal; players' heals arrive as
      * state deltas), so their bars only move on authoritative updates. */
     app->hp = fminf(app->hp_max, app->hp + app->hp_regen * dt);
-    app->stamina = fminf(app->stamina_max, app->stamina + app->stamina_regen * dt);
+    if (app->defending) {
+        app->stamina -= app->defend_drain * dt;
+        if (app->stamina < 0) app->stamina = 0;
+    } else {
+        app->stamina = fminf(app->stamina_max, app->stamina + app->stamina_regen * dt);
+    }
 
     /* bars ease toward the true value so a hit visibly drains (draft style) */
     app->hp_shown += (app->hp - app->hp_shown) * fminf(1.0f, 6.0f * dt);
@@ -1356,8 +1479,12 @@ static void draw_world_screen(app_t *app)
                 DrawCube(pos, 1.0f, 0.1f, 1.0f, c);
             } else {
                 pos.y = 0.5f;
-                DrawCube(pos, 1.0f, 1.0f, 1.0f, WALL_COL);
-                DrawCubeWires(pos, 1.0f, 1.0f, 1.0f, BG);
+                /* soft look: no hard outline, slightly lower body with a
+                 * lighter cap so the top edge reads beveled */
+                pos.y = 0.45f;
+                DrawCube(pos, 1.0f, 0.9f, 1.0f, WALL_COL);
+                pos.y = 0.92f;
+                DrawCube(pos, 0.94f, 0.06f, 0.94f, (Color){ 88, 88, 98, 255 });
             }
         }
     }
@@ -1418,6 +1545,14 @@ static void draw_world_screen(app_t *app)
     for (i = 0; i < MAX_PLAYERS; i++) {
         if (!app->players[i].used) continue;
         draw_flame(app->players[i].rx, app->players[i].ry, name_seed(app->players[i].name), 0);
+        if (app->players[i].defending) {
+            Vector3 pos = { app->players[i].rx, 0.55f, app->players[i].ry };
+            float pulse = 1.0f + 0.04f * sinf((float)now_d * 6.0f);
+            DrawCube(pos, 1.05f * pulse, 1.15f * pulse, 1.05f * pulse,
+                     Fade((Color){ 130, 160, 220, 255 }, 0.22f));
+            DrawCubeWires(pos, 1.05f * pulse, 1.15f * pulse, 1.05f * pulse,
+                          Fade((Color){ 170, 200, 250, 255 }, 0.7f));
+        }
         if (now_d - app->players[i].hit_time < HIT_FLASH) {
             float flash = 1.0f - (float)((now_d - app->players[i].hit_time) / HIT_FLASH);
             Vector3 pos = { app->players[i].rx, 0.5f, app->players[i].ry };
@@ -1426,6 +1561,14 @@ static void draw_world_screen(app_t *app)
     }
 
     draw_flame(app->self_rx, app->self_ry, name_seed(app->name), 1);
+    if (app->defending) {
+        Vector3 pos = { app->self_rx, 0.55f, app->self_ry };
+        float pulse = 1.0f + 0.04f * sinf((float)now_d * 6.0f);
+        DrawCube(pos, 1.05f * pulse, 1.15f * pulse, 1.05f * pulse,
+                 Fade((Color){ 130, 160, 220, 255 }, 0.22f));
+        DrawCubeWires(pos, 1.05f * pulse, 1.15f * pulse, 1.05f * pulse,
+                      Fade((Color){ 170, 200, 250, 255 }, 0.7f));
+    }
 
     EndMode3D();
 
@@ -1587,16 +1730,18 @@ int main(void)
     snprintf(app.address, sizeof(app.address), DEFAULT_ADDRESS);
     if (config_load(&app)) app.screen = SCREEN_HOME;
     else app.screen = SCREEN_SETUP;
+    history_load(&app);
 
     app.cam_dist = 14.0f;
     app.camera.up = (Vector3){ 0.0f, 1.0f, 0.0f };
     app.camera.fovy = 55.0f;
     app.camera.projection = CAMERA_PERSPECTIVE;
 
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(1100, 700, "gridmmo");
     SetTargetFPS(60);
     SetExitKey(KEY_NULL);
+    sound_init();
 
 
     while (!WindowShouldClose() && !app.want_quit) {
@@ -1625,6 +1770,7 @@ int main(void)
     }
 
     if (app.ws.state != WS_CLOSED) ws_close(&app.ws);
+    sound_shutdown();
     CloseWindow();
     return 0;
 }

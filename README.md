@@ -76,6 +76,7 @@ client/        C raylib client
 h j k l        move (count prefix works: 12j), costs stamina
 H J K L        dash (4 tiles per press: shift + move)
 d{motion}      melee attack (count = damage pool: 5dl)
+x              raise guard (drains stamina, blocks melee; esc or x releases)
 .              repeat last melee
 esc            clear pending count / operator
 zz / zZ        center screen vertically / both axes
@@ -92,8 +93,10 @@ zh zl zk zj    view the area left / right / above / below
 :disconnect           back to the home screen
 :connect [host:port]  connect + log in (no arg = last/default address)
 :setup                change the saved name/password
+:mute                 toggle sound
 
-Arrow up/down in command mode walks the command history.
+Arrow up/down in command mode walks the command history
+(persisted in gridmmo.hist).
 
 ```
 
