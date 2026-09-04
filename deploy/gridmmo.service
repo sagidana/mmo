@@ -1,0 +1,13 @@
+[Unit]
+Description=gridmmo server
+After=network.target
+
+[Service]
+User=gridmmo
+WorkingDirectory=/opt/gridmmo
+ExecStart=/opt/gridmmo/venv/bin/python3 -m server.main --host 0.0.0.0 --port 4000 --db /var/lib/gridmmo/gridmmo.db
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
