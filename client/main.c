@@ -35,10 +35,14 @@ enum {
 };
 
 enum {
-    SCREEN_CONNECT,
-    SCREEN_LOGIN,
+    SCREEN_SETUP,    /* first boot: pick name + password, saved to gridmmo.cfg */
+    SCREEN_HOME,     /* empty vim-style splash; :connect to play */
     SCREEN_WORLD,
 };
+
+#define MAX_HISTORY 32
+#define CONFIG_FILE "gridmmo.cfg"
+#define DEFAULT_ADDRESS "142.132.187.130:4000"
 
 enum {
     CONN_IDLE,
@@ -144,6 +148,10 @@ typedef struct {
     int last_count;
     int cmd_open;                    /* vim-style ':' command line */
     char cmd[128];
+    char cmd_history[MAX_HISTORY][128];
+    int hist_count;
+    int hist_nav;                    /* -1 = typing live, else index back in history */
+    char cmd_stash[128];             /* the live line while browsing history */
     int want_quit;
 
     Camera3D camera;
@@ -178,6 +186,40 @@ static void log_line(app_t *app, const char *line)
     app->event_born[slot] = GetTime();
     app->event_head = (app->event_head + 1) % MAX_EVENTS;
     app->event_total++;
+}
+
+/* three lines: name, password, last address; lives next to the binary */
+static int config_load(app_t *app)
+{
+    FILE *f = fopen(CONFIG_FILE, "r");
+    char name[64] = "";
+    char password[64] = "";
+    char address[128] = "";
+
+    if (f == NULL) return 0;
+    if (fgets(name, sizeof(name), f) == NULL) name[0] = '\0';
+    if (fgets(password, sizeof(password), f) == NULL) password[0] = '\0';
+    if (fgets(address, sizeof(address), f) == NULL) address[0] = '\0';
+    fclose(f);
+
+    name[strcspn(name, "\r\n")] = '\0';
+    password[strcspn(password, "\r\n")] = '\0';
+    address[strcspn(address, "\r\n")] = '\0';
+    if (name[0] == '\0' || password[0] == '\0') return 0;
+
+    snprintf(app->name, sizeof(app->name), "%s", name);
+    snprintf(app->password, sizeof(app->password), "%s", password);
+    if (address[0] != '\0') snprintf(app->address, sizeof(app->address), "%s", address);
+    return 1;
+}
+
+static void config_save(app_t *app)
+{
+    FILE *f = fopen(CONFIG_FILE, "w");
+
+    if (f == NULL) return;
+    fprintf(f, "%s\n%s\n%s\n", app->name, app->password, app->address);
+    fclose(f);
 }
 
 static player_t *player_find(app_t *app, const char *name)
@@ -359,7 +401,7 @@ static void disconnect(app_t *app, const char *why)
 
     if (app->ws.state != WS_CLOSED) ws_close(&app->ws);
     app->conn = CONN_IDLE;
-    app->screen = SCREEN_CONNECT;
+    app->screen = SCREEN_HOME;
     app->rtt_ms = 0;
     app->have_map = 0;
     app->have_state = 0;
@@ -530,9 +572,11 @@ static void handle_message(app_t *app, const char *raw)
     if (proto_parse(raw, &msg) != 0) return;
 
     if (strcmp(msg.type, "hello_ok") == 0) {
-        app->conn = CONN_GREETED;
-        app->screen = SCREEN_LOGIN;
         snprintf(app->motd, sizeof(app->motd), "%s", proto_data_str(&msg, "motd", ""));
+        /* log in right away with the saved identity */
+        app->seq++;
+        send_raw(app, proto_auth_password(app->seq, app->name, app->password));
+        app->conn = CONN_AUTH_SENT;
     } else if (strcmp(msg.type, "welcome") == 0) {
         cJSON *rules;
 
@@ -569,8 +613,10 @@ static void handle_message(app_t *app, const char *raw)
         app->stamina = app->stamina_max;
         app->hp_shown = app->hp_max;
         app->stamina_shown = app->stamina_max;
+        config_save(app);    /* remember the address that worked */
         snprintf(line, sizeof(line), "you entered the world as %s", app->name);
         log_line(app, line);
+        if (app->motd[0] != '\0') log_line(app, app->motd);
     } else if (strcmp(msg.type, "map") == 0) {
         handle_map(app, &msg);
     } else if (strcmp(msg.type, "state") == 0) {
@@ -630,9 +676,16 @@ static void handle_message(app_t *app, const char *raw)
         disconnect(app, "kicked: logged in elsewhere");
         return;
     } else if (strcmp(msg.type, "error") == 0) {
+        if (app->conn == CONN_AUTH_SENT || app->conn == CONN_HELLO_SENT) {
+            char why[160];
+
+            snprintf(why, sizeof(why), "%s", proto_data_str(&msg, "message", "unknown error"));
+            proto_msg_free(&msg);
+            disconnect(app, why);
+            return;
+        }
         snprintf(app->error, sizeof(app->error), "%s",
                  proto_data_str(&msg, "message", "unknown error"));
-        if (app->conn == CONN_AUTH_SENT) app->conn = CONN_GREETED;
     }
 
     proto_msg_free(&msg);
@@ -681,6 +734,22 @@ static void cmd_start(app_t *app)
     app->cmd[0] = '\0';
     app->count = 0;
     app->pending_z = 0;
+    app->hist_nav = -1;
+}
+
+static void cmd_history_push(app_t *app)
+{
+    int i;
+
+    if (app->cmd[0] == '\0') return;
+    if (app->hist_count > 0 && strcmp(app->cmd_history[app->hist_count - 1], app->cmd) == 0) return;
+
+    if (app->hist_count == MAX_HISTORY) {
+        for (i = 1; i < MAX_HISTORY; i++) strcpy(app->cmd_history[i - 1], app->cmd_history[i]);
+        app->hist_count--;
+    }
+    snprintf(app->cmd_history[app->hist_count], sizeof(app->cmd_history[0]), "%s", app->cmd);
+    app->hist_count++;
 }
 
 static void run_command(app_t *app)
@@ -704,6 +773,11 @@ static void run_command(app_t *app)
         if (arg != NULL) snprintf(app->address, sizeof(app->address), "%s", arg);
         if (app->conn != CONN_IDLE) disconnect(app, NULL);
         start_connect(app);
+    } else if (strcmp(cmd, "setup") == 0) {
+        if (app->conn != CONN_IDLE) disconnect(app, NULL);
+        app->error[0] = '\0';
+        app->focus = 0;
+        app->screen = SCREEN_SETUP;
     } else if (cmd[0] != '\0') {
         snprintf(line, sizeof(line), "not a command: %s", cmd);
         snprintf(app->error, sizeof(app->error), "%s", line);
@@ -722,7 +796,27 @@ static void update_command_mode(app_t *app)
     }
     if (IsKeyPressed(KEY_ENTER)) {
         app->cmd_open = 0;
+        cmd_history_push(app);
         run_command(app);
+        return;
+    }
+
+    /* arrows walk the command history, vim-style */
+    if (IsKeyPressed(KEY_UP) && app->hist_nav < app->hist_count - 1) {
+        if (app->hist_nav == -1) snprintf(app->cmd_stash, sizeof(app->cmd_stash), "%s", app->cmd);
+        app->hist_nav++;
+        snprintf(app->cmd, sizeof(app->cmd), "%s",
+                 app->cmd_history[app->hist_count - 1 - app->hist_nav]);
+        return;
+    }
+    if (IsKeyPressed(KEY_DOWN) && app->hist_nav >= 0) {
+        app->hist_nav--;
+        if (app->hist_nav == -1) {
+            snprintf(app->cmd, sizeof(app->cmd), "%s", app->cmd_stash);
+        } else {
+            snprintf(app->cmd, sizeof(app->cmd), "%s",
+                     app->cmd_history[app->hist_count - 1 - app->hist_nav]);
+        }
         return;
     }
     if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
@@ -744,10 +838,9 @@ static void update_command_mode(app_t *app)
     }
 }
 
-/* ---------------- input: connect + login ---------------- */
+/* ---------------- input: setup + home ---------------- */
 
-/* returns 1 if ':' on an empty field opened command mode */
-static int text_input(app_t *app, char *buf, size_t cap)
+static void text_input(char *buf, size_t cap)
 {
     int ch;
     size_t len = strlen(buf);
@@ -755,10 +848,6 @@ static int text_input(app_t *app, char *buf, size_t cap)
     for (;;) {
         ch = GetCharPressed();
         if (ch == 0) break;
-        if (ch == ':' && len == 0) {
-            cmd_start(app);
-            return 1;
-        }
         if (ch < 32 || ch > 126) continue;
         if (len + 1 >= cap) continue;
         buf[len++] = (char)ch;
@@ -767,33 +856,16 @@ static int text_input(app_t *app, char *buf, size_t cap)
     if (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressedRepeat(KEY_BACKSPACE)) {
         if (len > 0) buf[len - 1] = '\0';
     }
-    return 0;
 }
 
-static void update_connect_screen(app_t *app)
+static void update_setup_screen(app_t *app)
 {
-    if (app->conn != CONN_IDLE) return;
-
-    if (text_input(app, app->address, sizeof(app->address))) return;
-    if (IsKeyPressed(KEY_ENTER)) start_connect(app);
-}
-
-static void update_login_screen(app_t *app)
-{
-    int opened;
-
     if (IsKeyPressed(KEY_TAB)) app->focus = 1 - app->focus;
 
-    if (app->focus == 0) opened = text_input(app, app->name, sizeof(app->name));
-    else opened = text_input(app, app->password, sizeof(app->password));
-    if (opened) return;
+    if (app->focus == 0) text_input(app->name, sizeof(app->name));
+    else text_input(app->password, sizeof(app->password));
 
-    if (IsKeyPressed(KEY_ESCAPE)) {
-        disconnect(app, NULL);
-        return;
-    }
-
-    if (IsKeyPressed(KEY_ENTER) && app->conn == CONN_GREETED) {
+    if (IsKeyPressed(KEY_ENTER)) {
         if (app->name[0] == '\0') {
             snprintf(app->error, sizeof(app->error), "name is empty");
             return;
@@ -803,9 +875,22 @@ static void update_login_screen(app_t *app)
             return;
         }
         app->error[0] = '\0';
-        app->seq++;
-        send_raw(app, proto_auth_password(app->seq, app->name, app->password));
-        app->conn = CONN_AUTH_SENT;
+        config_save(app);
+        app->screen = SCREEN_HOME;
+    }
+}
+
+static void update_home_screen(app_t *app)
+{
+    int ch;
+
+    for (;;) {
+        ch = GetCharPressed();
+        if (ch == 0) break;
+        if (ch == ':') {
+            cmd_start(app);
+            return;
+        }
     }
 }
 
@@ -1075,33 +1160,58 @@ static void draw_status_bar(app_t *app)
     }
 }
 
-static void draw_connect_screen(app_t *app)
+static void draw_setup_screen(app_t *app)
 {
     DrawText("gridmmo", 40, 40, 32, ACCENT);
-    DrawText("layer 2", 40, 76, 18, DIM);
-
-    draw_field(40, 140, "server", app->address, 1, 0);
-    DrawText("enter to connect", 40, 180, 18, DIM);
-
-    if (app->conn == CONN_SOCKET || app->conn == CONN_HELLO_SENT) {
-        DrawText("connecting...", 40, 220, 20, FG);
-    }
-    if (app->error[0] != '\0') DrawText(app->error, 40, 250, 20, ERRCOL);
-}
-
-static void draw_login_screen(app_t *app)
-{
-    DrawText("gridmmo", 40, 40, 32, ACCENT);
-    if (app->motd[0] != '\0') DrawText(app->motd, 40, 80, 18, DIM);
+    DrawText("who are you? (first login on a server registers this identity)", 40, 80, 18, DIM);
 
     draw_field(40, 140, "name", app->name, app->focus == 0, 0);
     draw_field(40, 175, "password", app->password, app->focus == 1, 1);
 
-    DrawText("tab to switch, enter to log in (first login registers)", 40, 220, 18, DIM);
+    DrawText("tab to switch, enter to save", 40, 220, 18, DIM);
+    if (app->error[0] != '\0') DrawText(app->error, 40, 260, 20, ERRCOL);
+}
 
-    if (app->conn == CONN_AUTH_SENT) DrawText("logging in...", 40, 260, 20, FG);
-    if (app->conn == CONN_AUTHED) DrawText("entering world...", 40, 260, 20, FG);
-    if (app->error[0] != '\0') DrawText(app->error, 40, 290, 20, ERRCOL);
+/* vim :intro style — a few dim centered lines on an otherwise empty screen */
+static void draw_home_screen(app_t *app)
+{
+    const char *lines[5];
+    int sizes[5];
+    int count = 0;
+    int w = GetScreenWidth();
+    int y = GetScreenHeight() / 2 - 70;
+    int i;
+
+    lines[count] = "gridmmo";
+    sizes[count] = 30;
+    count++;
+    lines[count] = "";
+    sizes[count] = 18;
+    count++;
+    lines[count] = ":connect            join the last server";
+    sizes[count] = 18;
+    count++;
+    lines[count] = ":connect <ip:port>  join another";
+    sizes[count] = 18;
+    count++;
+    lines[count] = ":q                  quit";
+    sizes[count] = 18;
+    count++;
+
+    for (i = 0; i < count; i++) {
+        Color c = (i == 0) ? (Color){ 90, 120, 90, 255 } : DIM;
+
+        DrawText(lines[i], w / 2 - MeasureText(lines[i], sizes[i]) / 2, y, sizes[i], c);
+        y += sizes[i] + 12;
+    }
+
+    if (app->conn == CONN_SOCKET || app->conn == CONN_HELLO_SENT || app->conn == CONN_AUTH_SENT) {
+        const char *note = "connecting...";
+        DrawText(note, w / 2 - MeasureText(note, 18) / 2, y + 10, 18, FG);
+    }
+    if (app->error[0] != '\0') {
+        DrawText(app->error, w / 2 - MeasureText(app->error, 18) / 2, y + 40, 18, ERRCOL);
+    }
 }
 
 static float approach(float current, float target, float dt)
@@ -1472,9 +1582,11 @@ int main(void)
     srand((unsigned)time(NULL));   /* ws mask/key fallback where /dev/urandom is absent */
 
     memset(&app, 0, sizeof(app));
-    app.screen = SCREEN_CONNECT;
     app.conn = CONN_IDLE;
-    snprintf(app.address, sizeof(app.address), "142.132.187.130:4000");
+    app.hist_nav = -1;
+    snprintf(app.address, sizeof(app.address), DEFAULT_ADDRESS);
+    if (config_load(&app)) app.screen = SCREEN_HOME;
+    else app.screen = SCREEN_SETUP;
 
     app.cam_dist = 14.0f;
     app.camera.up = (Vector3){ 0.0f, 1.0f, 0.0f };
@@ -1494,8 +1606,8 @@ int main(void)
             update_command_mode(&app);
         } else {
             switch (app.screen) {
-            case SCREEN_CONNECT: update_connect_screen(&app); break;
-            case SCREEN_LOGIN: update_login_screen(&app); break;
+            case SCREEN_SETUP: update_setup_screen(&app); break;
+            case SCREEN_HOME: update_home_screen(&app); break;
             case SCREEN_WORLD: update_world_screen(&app); break;
             }
         }
@@ -1503,8 +1615,8 @@ int main(void)
         BeginDrawing();
         ClearBackground(BG);
         switch (app.screen) {
-        case SCREEN_CONNECT: draw_connect_screen(&app); break;
-        case SCREEN_LOGIN: draw_login_screen(&app); break;
+        case SCREEN_SETUP: draw_setup_screen(&app); break;
+        case SCREEN_HOME: draw_home_screen(&app); break;
         case SCREEN_WORLD: draw_world_screen(&app); break;
         }
         if (app.screen == SCREEN_WORLD && app.console_open) draw_console(&app);

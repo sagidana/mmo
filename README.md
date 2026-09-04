@@ -32,8 +32,11 @@ make client RAYLIB_DIR=~/raylib-5.5_linux_amd64   # or a release dir
 ./client
 ```
 
-Type the server address (`host:port`), enter, then name + password.
-First login registers the name. The lobby shows who is online.
+First boot asks for a name + password once and saves them to `gridmmo.cfg`
+next to the binary (plaintext — hobby-grade). After that the client opens
+on an empty home screen: `:connect` joins the last server (first ever
+connect uses the built-in default), `:connect host:port` joins another,
+`:setup` changes the saved identity. First login on a server registers it.
 
 ### Windows build (for friends)
 
@@ -86,8 +89,11 @@ zh zl zk zj    view the area left / right / above / below
 
 ```
 :q                    quit
-:disconnect           back to the connect screen
-:connect [host:port]  connect (no arg = current address)
+:disconnect           back to the home screen
+:connect [host:port]  connect + log in (no arg = last/default address)
+:setup                change the saved name/password
+
+Arrow up/down in command mode walks the command history.
 
 ```
 
