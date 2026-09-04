@@ -153,7 +153,7 @@ s->c  {"type": "intent_ok", "seq": 9, "data": {"granted": 2, "x": 4, "y": 9}}
   stamina each, the uncovered rest hits hp and breaks the guard; guard
   auto-breaks at 0 stamina; `defend` events `{"name", "on"}` broadcast to
   everyone, and full snapshots mark defenders with `"def": 1`).
-  Reserved: magic, grab, talk, action.
+  Reserved: grab, talk, action.
 - `motion`: move accepts `h j k l` and dash `H J K L` (capitals = a
   `dash_mult`-tile step in that direction); melee accepts `h j k l` only.
 - `count` is *requested*, 1..4096; `granted` is what the world allowed.
@@ -192,11 +192,31 @@ s->c  {"type": "intent_ok", "seq": 9, "data": {"granted": 5, "x": 4, "y": 7,
                                                "hp": 100, "stamina": 88.4}}
 ```
 
-## melee resolution (draft pool semantics)
+## melee resolution (draft pool semantics + commitment)
 
-The pool travels the motion line (entities only; walls do not stop it):
-each gap beyond adjacent costs `distance - 1` pool; the first entity absorbs
-pool capped at its health; leftover pierces only through kills.
+A melee is committed at intent time (stamina charged, `intent_ok` grants the
+pool) but resolves after a **wind-up** of `min(pool * melee_windup,
+windup_max)` seconds, followed by a **recovery** of `min(pool *
+melee_recover, recover_max)` during which all intents grant 0. A `windup`
+event broadcasts the telegraph; the `melee` event fires at the strike
+(now sent to the attacker too — clients animate at strike time):
+
+```
+s->c  {"type": "windup", "data": {"by": "dana", "motion": "l", "count": 12,
+                                  "x": 4, "y": 7, "strike_in": 0.36}}
+```
+
+The pool travels the motion line until a wall stops it: each gap beyond
+adjacent costs `distance - 1` pool; the first entity absorbs pool capped at
+its health; leftover pierces only through kills. Positions are read at
+strike time — wound-up attacks are dodgeable.
+
+**Directional guard**: the server tracks each entity's facing (last move or
+melee direction). A shield only blocks attacks arriving from the faced
+direction; flanked defenders take full hp damage and keep their guard up.
+Chasers telegraph bites (`windup`, 0.45s) with the direction locked —
+stepping away dodges. Rules gained `melee_windup`, `windup_max`,
+`melee_recover`, `recover_max`.
 
 ## events
 
@@ -218,6 +238,59 @@ Server-side entities living in the same session registry: they appear in
 `online`, `state`, and are valid melee targets; they send nothing. Started
 by default, disabled with `--no-npcs`. Current set: `dummy_1..3` (30 hp,
 static, in a row near spawn) and `walker` (60 hp, wanders).
+
+## magic (spells)
+
+The server owns the active spell. The catalog ships in `welcome`
+(`"spells": [{name, cost, speed, range, windup, recover}]` plus
+`"active_spell"`); selection is its own message; casts never name a spell:
+
+```
+c->s  {"type": "spell", "seq": 6, "data": {"spell": "firebolt"}}
+s->c  {"type": "spell_ok", "seq": 6, "data": {"spell": "firebolt"}}
+
+c->s  {"type": "intent", "seq": 9, "data": {"op": "magic", "motion": "l", "count": 8}}
+```
+
+`magic` follows the melee commitment flow (charge at intent, spell-scaled
+wind-up with a `windup` telegraph whose count is the aim-line range, then
+recovery). At the strike a projectile launches:
+
+```
+s->c  {"type": "bolt", "data": {"by": "sagi", "motion": "l", "x": 4, "y": 7,
+                                "speed": 9.0, "range": 15, "count": 8}}
+```
+
+The server advances bolts each tick: walls stop them, the first entity on
+the path takes `count` damage (directional guard applies), no pierce, and
+they fizzle at max range. Clients animate the flight locally from the
+single `bolt` event — a dodging target simply isn't there when it arrives.
+
+firebolt: cost 3/pt, speed 9 tiles/s, range 15, windup 0.04s/pt.
+
+# Protocol — Challenge mode
+
+Started with `--challenge <file>`, the server drops each player into a
+private instance of the challenge (own map occupancy, own npcs, own
+deltas — the open world is simply one shared instance of the same
+machinery). No position/vitals persistence; every entry is the file's
+prescribed conditions.
+
+```
+s->c  {"type": "challenge", "data": {"status": "start", "objective": "kill all enemies", "time": 0}}
+s->c  {"type": "challenge", "data": {"status": "won",   "objective": "...", "time": 42.7}}
+s->c  {"type": "challenge", "data": {"status": "lost",  "objective": "...", "time": 3.1}}
+
+c->s  {"type": "retry", "seq": 9, "data": {}}      <- resets the instance (challenge servers only)
+s->c  {"type": "retry_ok", "seq": 9, "data": {}}   then fresh vitals + state + challenge start
+```
+
+- After won/lost the instance freezes: all intents grant 0 until `retry`.
+- Objectives: `kill_all` (challenge npcs never respawn), `survive <sec>`,
+  `reach <x,y>`. Death = lost.
+- Npc kinds: `dummy` (static), `walker` (wanders), `chaser` (hunts the
+  nearest player, bites `damage` when adjacent; shields block bites).
+- Challenge `[rules]` merge over server defaults and ship in `welcome`.
 
 ## Wire format evolution
 

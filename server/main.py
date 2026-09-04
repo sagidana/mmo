@@ -11,9 +11,11 @@ def main():
     parser.add_argument("--db", default="gridmmo.db")
     parser.add_argument("--map", default="server/map.txt")
     parser.add_argument("--no-npcs", action="store_true")
+    parser.add_argument("--challenge", default=None)
     args = parser.parse_args()
 
-    server = Server(args.host, args.port, args.db, args.map, npcs=not args.no_npcs)
+    server = Server(args.host, args.port, args.db, args.map,
+                    npcs=not args.no_npcs, challenge_path=args.challenge)
     try:
         asyncio.run(server.serve())
     except KeyboardInterrupt:

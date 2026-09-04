@@ -1,0 +1,30 @@
+; the circle of mages — three fire spirits guard the arena, hurling
+; dodgeable bolts whenever you line up with them. pillars stop bolts:
+; break their sightlines, close the gap, cut them down. a hound keeps
+; you honest while you hide.
+;   python3 -m server.main --challenge challenges/mages.txt
+
+[npcs]
+mage   22,2   hp=25 damage=12 every=1.8
+mage   3,11   hp=25 damage=12 every=1.8
+mage   20,12  hp=25 damage=12 every=1.8
+chaser 12,8   hp=35 damage=6
+
+[objective]
+kill_all
+
+[map]
+##########################
+#........................#
+#..##.....##.............#
+#.........##......##.....#
+#.S................##....#
+#........#..####.........#
+#..####..#...............#
+#............##....###...#
+#....................#...#
+#..###......####.........#
+#........................#
+#.....##.........##......#
+#........................#
+##########################

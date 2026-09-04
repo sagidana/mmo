@@ -20,6 +20,14 @@ registers it. The map is an ASCII file (`.` floor, `#` wall, `S` spawn) —
 edit it in vim, restart the server. Training NPCs spawn near `S` by default
 (dummies to hit, a wanderer); `--no-npcs` disables them.
 
+### Challenge mode
+
+`--challenge challenges/example.txt` runs the server as a challenge:
+every player gets a private instance with prescribed conditions (map,
+starting vitals, npcs, objective) and must overcome it — result and time
+show on screen, `:retry` resets. Challenge files are single vim-editable
+text files; see `challenges/example.txt` for the format.
+
 ## Client
 
 Needs raylib. Either install it system-wide (`pkg-config raylib` must work)
@@ -76,7 +84,10 @@ client/        C raylib client
 h j k l        move (count prefix works: 12j), costs stamina
 H J K L        dash (4 tiles per press: shift + move)
 d{motion}      melee attack (count = damage pool: 5dl)
-x              raise guard (drains stamina, blocks melee; esc or x releases)
+x              raise guard (blocks the faced direction; esc or x releases)
+ctrl-hjkl      turn in place (aim / steer the guard)
+m{motion}      cast the active spell (count = power: 8ml)
+s              open the spellbook (j/k, enter selects)
 .              repeat last melee
 esc            clear pending count / operator
 zz / zZ        center screen vertically / both axes

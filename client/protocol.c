@@ -62,6 +62,19 @@ char *proto_intent(int seq, const char *op, const char *motion, int count)
     return envelope("intent", seq, data);
 }
 
+char *proto_retry(int seq)
+{
+    return envelope("retry", seq, cJSON_CreateObject());
+}
+
+char *proto_spell(int seq, const char *spell)
+{
+    cJSON *data = cJSON_CreateObject();
+
+    cJSON_AddStringToObject(data, "spell", spell);
+    return envelope("spell", seq, data);
+}
+
 int proto_parse(const char *raw, proto_msg_t *msg)
 {
     cJSON *root = cJSON_Parse(raw);

@@ -1,0 +1,15 @@
+; the hallway — a cannon guards the far end, firing down the corridor
+; every 2.2 seconds. one hit kills. duck into the holes between shots,
+; work your way close, and cut it down.
+
+[npcs]
+shooter 29,2 hp=45 damage=9999 dir=h every=2.2
+
+[objective]
+kill_all
+
+[map]
+###############################
+#S###.###.###.###.###.###.##.##
+#.............................#
+###############################

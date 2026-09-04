@@ -18,6 +18,8 @@ char *proto_auth_password(int seq, const char *name, const char *password);
 char *proto_auth_token(int seq, const char *name, const char *token);
 char *proto_ping(int seq, double t);
 char *proto_intent(int seq, const char *op, const char *motion, int count);
+char *proto_retry(int seq);
+char *proto_spell(int seq, const char *spell);
 
 /* parses an envelope; returns 0 on success; call proto_msg_free after */
 int proto_parse(const char *raw, proto_msg_t *msg);

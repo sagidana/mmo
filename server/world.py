@@ -24,17 +24,23 @@ MOVE_DIRS.update(MOTIONS)
 MOVE_DIRS.update(DASH_MOTIONS)
 
 
+def load_world(map_path):
+    lines = []
+    with open(map_path) as map_file:
+        for line in map_file.readlines():
+            lines.append(line.rstrip('\n'))
+    return World(lines)
+
+
 class World():
-    def __init__(self, map_path):
+    def __init__(self, raw_lines):
         self.tiles = []
         self.spawn = None
 
         lines = []
-        with open(map_path) as map_file:
-            for line in map_file.readlines():
-                line = line.rstrip('\n')
-                if line == "": continue
-                lines.append(line)
+        for line in raw_lines:
+            if line.strip() == "": continue
+            lines.append(line)
 
         self.height = len(lines)
         self.width = 0
@@ -55,7 +61,7 @@ class World():
             self.tiles.append(row)
             y += 1
 
-        if self.spawn is None: raise ValueError(f"map {map_path} has no S spawn tile")
+        if self.spawn is None: raise ValueError("map has no S spawn tile")
 
     def tile(self, x, y):
         if x < 0 or y < 0: return WALL
@@ -83,13 +89,16 @@ class World():
         return granted, x, y
 
     def ray_targets(self, x, y, motion, reach, occupied):
-        # entities on the melee ray, nearest first, as (key, distance) pairs;
-        # the ray cares only about entities, not walls (draft semantics)
+        # entities on the attack ray, nearest first, as (key, distance) pairs;
+        # walls stop the ray
         dx, dy = MOTIONS[motion]
         targets = []
         distance = 1
         while distance <= reach:
-            pos = (x + dx * distance, y + dy * distance)
+            tx = x + dx * distance
+            ty = y + dy * distance
+            if self.tile(tx, ty) != FLOOR: break
+            pos = (tx, ty)
             if pos in occupied: targets.append((occupied[pos], distance))
             distance += 1
         return targets

@@ -1,4 +1,5 @@
 #include "raylib.h"
+#include "rlgl.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -9,6 +10,7 @@
 #include "ws.h"
 #include "protocol.h"
 #include "sound.h"
+#include "figures.h"
 
 #define MAX_PLAYERS 128
 #define MAX_LOG 8
@@ -27,6 +29,11 @@
 #define DEATH_EMBERS 16
 #define MAX_DMG 32
 #define DMG_TTL 0.6f
+#define MAX_ATTACK_FX 32
+#define ATTACK_FX_TTL 0.3f
+#define MAX_TELEGRAPH 24
+#define MAX_SPELLS 8
+#define MAX_BOLTS 16
 
 enum {
     TRAIL_WARM,      /* own movement */
@@ -114,6 +121,9 @@ typedef struct {
     float hp_shown;        /* eases toward hp so damage visibly drains */
     double hit_time;
     int defending;
+    int figure;
+    char facing;
+    double moved_at;
 } player_t;
 
 typedef struct {
@@ -123,6 +133,49 @@ typedef struct {
     int amount;
     float born;
 } dmg_t;
+
+typedef struct {
+    int used;
+    int x;             /* attacker tile */
+    int y;
+    int dx;            /* ray direction */
+    int dy;
+    int count;         /* ray length in tiles */
+    float born;
+    int own;           /* gold for own swings, red for incoming */
+} attack_fx_t;
+
+typedef struct {
+    int used;
+    int x;             /* attacker tile */
+    int y;
+    int dx;
+    int dy;
+    int count;
+    double until;      /* the strike lands here; marker dies then */
+    int own;
+} telegraph_t;
+
+typedef struct {
+    char name[24];
+    float cost;
+    float speed;
+    float range;
+    float windup;
+    float recover;
+} spell_t;
+
+typedef struct {
+    int used;
+    int x;             /* launch tile */
+    int y;
+    int dx;
+    int dy;
+    float speed;
+    float range;
+    double born;
+    int own;
+} bolt_t;
 
 typedef struct {
     int used;
@@ -159,6 +212,17 @@ typedef struct {
     int trail_next;
     dmg_t dmg[MAX_DMG];              /* floating damage numbers */
     int dmg_next;
+    attack_fx_t attack_fx[MAX_ATTACK_FX];
+    int attack_fx_next;
+    telegraph_t telegraph[MAX_TELEGRAPH];
+    int telegraph_next;
+    bolt_t bolts[MAX_BOLTS];
+    int bolt_next;
+    spell_t spells[MAX_SPELLS];
+    int spell_count;
+    int active_spell;                /* index; server confirms via spell_ok */
+    int book_open;                   /* the spellbook overlay */
+    int book_sel;
     int self_x;
     int self_y;
     float self_rx;
@@ -178,6 +242,15 @@ typedef struct {
     int melee_cost;
     int dash_mult;
     float defend_drain;
+    float melee_windup;
+    float windup_max;
+    float melee_recover;
+    float recover_max;
+    double self_windup_until;        /* own cast: locked until this */
+    double self_recover_until;       /* then recovering until this */
+    double self_windup_len;
+    char self_facing;
+    double self_moved_at;
     int defending;
     int defend_off_wanted;           /* we asked to lower the guard (vs. it broke) */
     double self_hit_time;
@@ -186,7 +259,7 @@ typedef struct {
     int count;                       /* pending count prefix, 0 = none */
     int pending_z;                   /* saw 'z', waiting for second key */
     int pending_op;                  /* 'd' waiting for its motion, 0 = none */
-    int last_kind;                   /* dot-repeat: 0 none, 1 move, 2 melee */
+    int last_kind;                   /* dot-repeat: 0 none, 2 melee, 3 magic */
     char last_motion[2];
     int last_count;
     char cmd[128];                   /* console prompt line */
@@ -210,6 +283,13 @@ typedef struct {
     int console_open;                /* ~ toggles the event console */
     int console_scroll;              /* lines scrolled up from the bottom */
 
+    /* challenge mode */
+    int challenge_active;
+    char challenge_status[8];        /* run / won / lost */
+    char challenge_objective[64];
+    double challenge_start;
+    float challenge_time;
+
     double last_ping;
     double rtt_ms;
 
@@ -219,6 +299,9 @@ typedef struct {
 } app_t;
 
 static void trail_add_path(app_t *app, int x0, int y0, int x1, int y1, int kind);
+static int occupied(app_t *app, int x, int y);
+static int tile_at(app_t *app, int x, int y);
+static int self_busy(app_t *app);
 
 /* ---------------- log + players ---------------- */
 
@@ -328,9 +411,22 @@ static void player_upsert(app_t *app, const char *name, int x, int y)
         p->hp_shown = 0;
         p->hit_time = 0;
         p->defending = 0;
+        p->figure = FIG_HUMAN;
+        p->facing = 'j';
+        p->moved_at = 0;
         return;
     }
     trail_add_path(app, p->x, p->y, x, y, TRAIL_COLD);
+    if (x != p->x || y != p->y) {
+        int dx = x - p->x;
+        int dy = y - p->y;
+
+        if (dx > 0) p->facing = 'l';
+        if (dx < 0) p->facing = 'h';
+        if (dy > 0 && abs(dy) >= abs(dx)) p->facing = 'j';
+        if (dy < 0 && abs(dy) >= abs(dx)) p->facing = 'k';
+        p->moved_at = GetTime();
+    }
     p->x = x;
     p->y = y;
 }
@@ -413,18 +509,49 @@ static void dmg_add(app_t *app, float wx, float wy, int amount)
     sound_play(SND_HIT);
 }
 
-/* melee swing: streak along the ray, including the far tile */
-static void trail_add_attack(app_t *app, int x, int y, const char *motion, int count)
+/* melee swing: ember streak + a bright blade-cross on every ray tile */
+static void trail_add_attack(app_t *app, int x, int y, const char *motion, int count, int own)
 {
     int dx = 0;
     int dy = 0;
+    attack_fx_t *fx;
+
+    int i;
 
     if (motion[0] == 'h') dx = -1;
     if (motion[0] == 'l') dx = 1;
     if (motion[0] == 'k') dy = -1;
     if (motion[0] == 'j') dy = 1;
     if (count > 40) count = 40;
+
+    /* the strike stops at walls and at the first body; so does the visual */
+    for (i = 1; i <= count; i++) {
+        int tx = x + dx * i;
+        int ty = y + dy * i;
+
+        if (tile_at(app, tx, ty) != 0) {
+            count = i - 1;
+            break;
+        }
+        if (occupied(app, tx, ty) || (tx == app->self_x && ty == app->self_y)) {
+            count = i;
+            break;
+        }
+    }
+    if (count < 1) return;
+
     trail_add_path(app, x + dx, y + dy, x + dx * (count + 1), y + dy * (count + 1), TRAIL_ATTACK);
+
+    fx = &app->attack_fx[app->attack_fx_next];
+    app->attack_fx_next = (app->attack_fx_next + 1) % MAX_ATTACK_FX;
+    fx->used = 1;
+    fx->x = x;
+    fx->y = y;
+    fx->dx = dx;
+    fx->dy = dy;
+    fx->count = count;
+    fx->born = (float)GetTime();
+    fx->own = own;
 }
 
 /* ---------------- local world rules (mirror of server/world.py) ---------------- */
@@ -484,12 +611,19 @@ static void disconnect(app_t *app, const char *why)
     app->last_kind = 0;
     app->defending = 0;
     app->defend_off_wanted = 0;
+    app->challenge_active = 0;
     app->self_hit_time = 0;
     free(app->tiles);
     app->tiles = NULL;
     for (i = 0; i < MAX_PLAYERS; i++) app->players[i].used = 0;
     for (i = 0; i < MAX_TRAIL; i++) app->trail[i].used = 0;
     for (i = 0; i < MAX_DMG; i++) app->dmg[i].used = 0;
+    for (i = 0; i < MAX_ATTACK_FX; i++) app->attack_fx[i].used = 0;
+    for (i = 0; i < MAX_TELEGRAPH; i++) app->telegraph[i].used = 0;
+    for (i = 0; i < MAX_BOLTS; i++) app->bolts[i].used = 0;
+    app->book_open = 0;
+    app->self_windup_until = 0;
+    app->self_recover_until = 0;
     app->event_head = 0;
     app->event_total = 0;
     app->console_open = 0;
@@ -617,7 +751,9 @@ static void handle_state(app_t *app, proto_msg_t *msg)
         p = player_find(app, name->valuestring);
         if (p != NULL) {
             cJSON *def = cJSON_GetObjectItem(entry, "def");
+            cJSON *fig = cJSON_GetObjectItem(entry, "figure");
             if (cJSON_IsNumber(def)) p->defending = (int)def->valuedouble;
+            if (cJSON_IsString(fig)) p->figure = figures_from_name(fig->valuestring);
         }
         if (p != NULL && cJSON_IsNumber(hp)) {
             float new_hp = (float)hp->valuedouble;
@@ -672,6 +808,10 @@ static void handle_message(app_t *app, const char *raw)
         app->melee_cost = 2;
         app->dash_mult = 4;
         app->defend_drain = 6.0f;
+        app->melee_windup = 0.03f;
+        app->windup_max = 1.0f;
+        app->melee_recover = 0.02f;
+        app->recover_max = 0.6f;
         if (rules != NULL) {
             cJSON *item = cJSON_GetObjectItem(rules, "hp_max");
             if (cJSON_IsNumber(item)) app->hp_max = (float)item->valuedouble;
@@ -689,11 +829,53 @@ static void handle_message(app_t *app, const char *raw)
             if (cJSON_IsNumber(item)) app->dash_mult = (int)item->valuedouble;
             item = cJSON_GetObjectItem(rules, "defend_drain");
             if (cJSON_IsNumber(item)) app->defend_drain = (float)item->valuedouble;
+            item = cJSON_GetObjectItem(rules, "melee_windup");
+            if (cJSON_IsNumber(item)) app->melee_windup = (float)item->valuedouble;
+            item = cJSON_GetObjectItem(rules, "windup_max");
+            if (cJSON_IsNumber(item)) app->windup_max = (float)item->valuedouble;
+            item = cJSON_GetObjectItem(rules, "melee_recover");
+            if (cJSON_IsNumber(item)) app->melee_recover = (float)item->valuedouble;
+            item = cJSON_GetObjectItem(rules, "recover_max");
+            if (cJSON_IsNumber(item)) app->recover_max = (float)item->valuedouble;
         }
         app->hp = app->hp_max;
         app->stamina = app->stamina_max;
         app->hp_shown = app->hp_max;
         app->stamina_shown = app->stamina_max;
+        app->spell_count = 0;
+        app->active_spell = 0;
+        {
+            cJSON *spells = cJSON_GetObjectItem(msg.data, "spells");
+            cJSON *entry;
+            const char *active = proto_data_str(&msg, "active_spell", "");
+
+            cJSON_ArrayForEach(entry, spells) {
+                cJSON *sname = cJSON_GetObjectItem(entry, "name");
+                spell_t *sp;
+
+                if (!cJSON_IsString(sname)) continue;
+                if (app->spell_count >= MAX_SPELLS) break;
+                sp = &app->spells[app->spell_count];
+                snprintf(sp->name, sizeof(sp->name), "%s", sname->valuestring);
+                sp->cost = 3.0f;
+                sp->speed = 9.0f;
+                sp->range = 15.0f;
+                sp->windup = 0.04f;
+                sp->recover = 0.02f;
+                sname = cJSON_GetObjectItem(entry, "cost");
+                if (cJSON_IsNumber(sname)) sp->cost = (float)sname->valuedouble;
+                sname = cJSON_GetObjectItem(entry, "speed");
+                if (cJSON_IsNumber(sname)) sp->speed = (float)sname->valuedouble;
+                sname = cJSON_GetObjectItem(entry, "range");
+                if (cJSON_IsNumber(sname)) sp->range = (float)sname->valuedouble;
+                sname = cJSON_GetObjectItem(entry, "windup");
+                if (cJSON_IsNumber(sname)) sp->windup = (float)sname->valuedouble;
+                sname = cJSON_GetObjectItem(entry, "recover");
+                if (cJSON_IsNumber(sname)) sp->recover = (float)sname->valuedouble;
+                if (strcmp(sp->name, active) == 0) app->active_spell = app->spell_count;
+                app->spell_count++;
+            }
+        }
         config_save(app);    /* remember the address that worked */
         snprintf(line, sizeof(line), "you entered the world as %s", app->name);
         log_line(app, line);
@@ -730,12 +912,48 @@ static void handle_message(app_t *app, const char *raw)
             app->outstanding = 0;
         }
     } else if (strcmp(msg.type, "melee") == 0) {
+        const char *by = proto_data_str(&msg, "by", "?");
+        const char *mo = proto_data_str(&msg, "motion", "l");
+        int own = strcmp(by, app->name) == 0;
+        player_t *pb = player_find(app, by);
+
+        if (pb != NULL) pb->facing = mo[0];
         sound_play(SND_SWING);
         trail_add_attack(app,
                          (int)proto_data_num(&msg, "x", 0),
                          (int)proto_data_num(&msg, "y", 0),
-                         proto_data_str(&msg, "motion", "l"),
-                         (int)proto_data_num(&msg, "count", 1));
+                         mo, (int)proto_data_num(&msg, "count", 1), own);
+    } else if (strcmp(msg.type, "windup") == 0) {
+        const char *by = proto_data_str(&msg, "by", "?");
+        const char *mo = proto_data_str(&msg, "motion", "l");
+        telegraph_t *tg = &app->telegraph[app->telegraph_next];
+        player_t *pb = player_find(app, by);
+
+        if (pb != NULL) pb->facing = mo[0];
+        app->telegraph_next = (app->telegraph_next + 1) % MAX_TELEGRAPH;
+        tg->used = 1;
+        tg->x = (int)proto_data_num(&msg, "x", 0);
+        tg->y = (int)proto_data_num(&msg, "y", 0);
+        tg->dx = 0;
+        tg->dy = 0;
+        if (mo[0] == 'h') tg->dx = -1;
+        if (mo[0] == 'l') tg->dx = 1;
+        if (mo[0] == 'k') tg->dy = -1;
+        if (mo[0] == 'j') tg->dy = 1;
+        tg->count = (int)proto_data_num(&msg, "count", 1);
+        if (tg->count > 40) tg->count = 40;
+        {
+            int k;
+
+            for (k = 1; k <= tg->count; k++) {
+                if (tile_at(app, tg->x + tg->dx * k, tg->y + tg->dy * k) != 0) {
+                    tg->count = k - 1;
+                    break;
+                }
+            }
+        }
+        tg->until = GetTime() + proto_data_num(&msg, "strike_in", 0.3);
+        tg->own = strcmp(by, app->name) == 0;
     } else if (strcmp(msg.type, "defend") == 0) {
         const char *who = proto_data_str(&msg, "name", "?");
         int on = 0;
@@ -771,6 +989,62 @@ static void handle_message(app_t *app, const char *raw)
 
         snprintf(line, sizeof(line), "%s was slain by %s", victim, proto_data_str(&msg, "by", "?"));
         log_line(app, line);
+    } else if (strcmp(msg.type, "challenge") == 0) {
+        const char *status = proto_data_str(&msg, "status", "");
+
+        if (strcmp(status, "start") == 0) {
+            app->challenge_active = 1;
+            snprintf(app->challenge_status, sizeof(app->challenge_status), "run");
+            snprintf(app->challenge_objective, sizeof(app->challenge_objective), "%s",
+                     proto_data_str(&msg, "objective", ""));
+            app->challenge_start = GetTime();
+            snprintf(line, sizeof(line), "challenge: %s", app->challenge_objective);
+            log_line(app, line);
+        } else if (strcmp(status, "won") == 0) {
+            snprintf(app->challenge_status, sizeof(app->challenge_status), "won");
+            app->challenge_time = (float)proto_data_num(&msg, "time", 0);
+            snprintf(line, sizeof(line), "challenge cleared in %.1fs", app->challenge_time);
+            log_line(app, line);
+            sound_play(SND_GUARD_ON);
+        } else if (strcmp(status, "lost") == 0) {
+            snprintf(app->challenge_status, sizeof(app->challenge_status), "lost");
+            app->challenge_time = (float)proto_data_num(&msg, "time", 0);
+            snprintf(line, sizeof(line), "challenge failed after %.1fs", app->challenge_time);
+            log_line(app, line);
+        }
+    } else if (strcmp(msg.type, "face") == 0) {
+        player_t *pf = player_find(app, proto_data_str(&msg, "name", "?"));
+
+        if (pf != NULL) pf->facing = proto_data_str(&msg, "motion", "j")[0];
+    } else if (strcmp(msg.type, "spell_ok") == 0) {
+        const char *sname = proto_data_str(&msg, "spell", "");
+        int i2;
+
+        for (i2 = 0; i2 < app->spell_count; i2++) {
+            if (strcmp(app->spells[i2].name, sname) == 0) app->active_spell = i2;
+        }
+        snprintf(line, sizeof(line), "spell: %s", sname);
+        log_line(app, line);
+    } else if (strcmp(msg.type, "bolt") == 0) {
+        const char *by = proto_data_str(&msg, "by", "?");
+        const char *mo = proto_data_str(&msg, "motion", "l");
+        bolt_t *b = &app->bolts[app->bolt_next];
+
+        app->bolt_next = (app->bolt_next + 1) % MAX_BOLTS;
+        b->used = 1;
+        b->x = (int)proto_data_num(&msg, "x", 0);
+        b->y = (int)proto_data_num(&msg, "y", 0);
+        b->dx = 0;
+        b->dy = 0;
+        if (mo[0] == 'h') b->dx = -1;
+        if (mo[0] == 'l') b->dx = 1;
+        if (mo[0] == 'k') b->dy = -1;
+        if (mo[0] == 'j') b->dy = 1;
+        b->speed = (float)proto_data_num(&msg, "speed", 9);
+        b->range = (float)proto_data_num(&msg, "range", 15);
+        b->born = GetTime();
+        b->own = strcmp(by, app->name) == 0;
+        sound_play(SND_SWING);
     } else if (strcmp(msg.type, "pong") == 0) {
         app->rtt_ms = GetTime() * 1000.0 - proto_data_num(&msg, "t", 0);
     } else if (strcmp(msg.type, "player_joined") == 0) {
@@ -794,6 +1068,10 @@ static void handle_message(app_t *app, const char *raw)
         }
         snprintf(app->error, sizeof(app->error), "%s",
                  proto_data_str(&msg, "message", "unknown error"));
+        if (app->screen == SCREEN_WORLD) {
+            snprintf(line, sizeof(line), "error: %s", app->error);
+            log_line(app, line);
+        }
     }
 
     proto_msg_free(&msg);
@@ -864,8 +1142,8 @@ static void history_push(app_t *app, const char *line)
     history_save(app);
 }
 
-static const char *COMMANDS[] = { "connect", "disconnect", "mute", "q", "setup" };
-#define COMMAND_COUNT 5
+static const char *COMMANDS[] = { "connect", "disconnect", "mute", "q", "retry", "setup" };
+#define COMMAND_COUNT 6
 
 /* tab cycles through commands matching the typed prefix */
 static void cmd_tab_complete(app_t *app)
@@ -912,6 +1190,11 @@ static void run_command(app_t *app)
         if (arg != NULL) snprintf(app->address, sizeof(app->address), "%s", arg);
         if (app->conn != CONN_IDLE) disconnect(app, NULL);
         start_connect(app);
+    } else if (strcmp(cmd, "retry") == 0) {
+        if (app->conn == CONN_AUTHED) {
+            app->seq++;
+            send_raw(app, proto_retry(app->seq));
+        }
     } else if (strcmp(cmd, "mute") == 0) {
         sound_toggle_mute();
         if (app->screen == SCREEN_WORLD) {
@@ -1090,6 +1373,7 @@ static void do_move(app_t *app, int dx, int dy, const char *motion, int mult)
 
     if (count == 0) count = 1;
     app->count = 0;
+    if (self_busy(app)) return;
 
     /* optimistic echo: predict with the same rule the server runs.
      * a dash moves `mult` tiles per requested count; the server derives the
@@ -1101,9 +1385,15 @@ static void do_move(app_t *app, int dx, int dy, const char *motion, int mult)
     }
     if (tiles <= 0) return;
 
+    if (dx > 0) app->self_facing = 'l';
+    if (dx < 0) app->self_facing = 'h';
+    if (dy > 0) app->self_facing = 'j';
+    if (dy < 0) app->self_facing = 'k';
+
     granted = local_resolve_move(app, dx, dy, tiles, &x, &y);
     if (granted > 0) {
         sound_play(SND_STEP);
+        app->self_moved_at = GetTime();
         trail_add_path(app, app->self_x, app->self_y, x, y, TRAIL_WARM);
         app->self_x = x;
         app->self_y = y;
@@ -1116,6 +1406,11 @@ static void do_move(app_t *app, int dx, int dy, const char *motion, int mult)
     send_raw(app, proto_intent(app->seq, "move", motion, count));
 }
 
+static int self_busy(app_t *app)
+{
+    return GetTime() < app->self_recover_until;
+}
+
 static void do_melee(app_t *app, const char *motion)
 {
     int count = app->count;
@@ -1124,6 +1419,11 @@ static void do_melee(app_t *app, const char *motion)
     if (count == 0) count = 1;
     app->count = 0;
     record_op(app, 2, motion, count);
+    if (self_busy(app)) return;
+
+    if (motion[0] == 'h' || motion[0] == 'j' || motion[0] == 'k' || motion[0] == 'l') {
+        app->self_facing = motion[0];
+    }
 
     pool = count;
     if (app->melee_cost > 0) {
@@ -1131,8 +1431,15 @@ static void do_melee(app_t *app, const char *motion)
         if (pool > affordable) pool = affordable;
     }
     if (pool > 0) {
-        sound_play(SND_SWING);
-        trail_add_attack(app, app->self_x, app->self_y, motion, pool);
+        float windup = (float)pool * app->melee_windup;
+        float recover = (float)pool * app->melee_recover;
+
+        if (windup > app->windup_max) windup = app->windup_max;
+        if (recover > app->recover_max) recover = app->recover_max;
+        app->self_windup_until = GetTime() + windup;
+        app->self_recover_until = app->self_windup_until + recover;
+        app->self_windup_len = windup;
+
         app->stamina -= (float)(pool * app->melee_cost);
         if (app->stamina < 0) app->stamina = 0;
     }
@@ -1149,9 +1456,87 @@ static void send_defend(app_t *app, int on)
     send_raw(app, proto_intent(app->seq, "defend", on ? "on" : "off", 1));
 }
 
+static void do_magic(app_t *app, const char *motion)
+{
+    int count = app->count;
+    int pool;
+    spell_t *sp;
+
+    if (count == 0) count = 1;
+    app->count = 0;
+    record_op(app, 3, motion, count);
+    if (self_busy(app)) return;
+    if (app->spell_count == 0) return;
+    sp = &app->spells[app->active_spell];
+
+    if (motion[0] == 'h' || motion[0] == 'j' || motion[0] == 'k' || motion[0] == 'l') {
+        app->self_facing = motion[0];
+    }
+
+    pool = count;
+    if (sp->cost > 0) {
+        int affordable = (int)(app->stamina / sp->cost);
+        if (pool > affordable) pool = affordable;
+    }
+    if (pool > 0) {
+        float windup = (float)pool * sp->windup;
+        float recover = (float)pool * sp->recover;
+
+        if (windup > app->windup_max) windup = app->windup_max;
+        if (recover > app->recover_max) recover = app->recover_max;
+        app->self_windup_until = GetTime() + windup;
+        app->self_recover_until = app->self_windup_until + recover;
+        app->self_windup_len = windup;
+
+        app->stamina -= (float)pool * sp->cost;
+        if (app->stamina < 0) app->stamina = 0;
+    }
+
+    app->seq++;
+    app->outstanding++;
+    send_raw(app, proto_intent(app->seq, "magic", motion, count));
+}
+
 static void update_world_screen(app_t *app)
 {
     int ch;
+
+    if (app->book_open) {
+        for (;;) {
+            ch = GetCharPressed();
+            if (ch == 0) break;
+            if (ch == 's' || ch == 'q') app->book_open = 0;
+            else if (ch == 'j' && app->book_sel < app->spell_count - 1) app->book_sel++;
+            else if (ch == 'k' && app->book_sel > 0) app->book_sel--;
+        }
+        if (IsKeyPressed(KEY_ESCAPE)) app->book_open = 0;
+        if (IsKeyPressed(KEY_ENTER) && app->book_sel < app->spell_count) {
+            app->book_open = 0;
+            app->seq++;
+            send_raw(app, proto_spell(app->seq, app->spells[app->book_sel].name));
+        }
+        return;
+    }
+
+    /* ctrl-hjkl: turn in place (steers the guard too) */
+    if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) {
+        char face = 0;
+
+        if (IsKeyPressed(KEY_H)) face = 'h';
+        if (IsKeyPressed(KEY_J)) face = 'j';
+        if (IsKeyPressed(KEY_K)) face = 'k';
+        if (IsKeyPressed(KEY_L)) face = 'l';
+        if (face != 0 && !self_busy(app)) {
+            char m[2];
+
+            m[0] = face;
+            m[1] = '\0';
+            app->self_facing = face;
+            app->seq++;
+            app->outstanding++;
+            send_raw(app, proto_intent(app->seq, "face", m, 1));
+        }
+    }
 
     if (IsKeyPressed(KEY_ESCAPE)) {
         app->count = 0;
@@ -1183,13 +1568,23 @@ static void update_world_screen(app_t *app)
             continue;
         }
 
-        if (app->pending_op == 'd') {
+        if (app->pending_op == 'd' || app->pending_op == 'm') {
+            int was_magic = app->pending_op == 'm';
+
             app->pending_op = 0;
             switch (ch) {
-            case 'h': do_melee(app, "h"); break;
-            case 'j': do_melee(app, "j"); break;
-            case 'k': do_melee(app, "k"); break;
-            case 'l': do_melee(app, "l"); break;
+            case 'h':
+            case 'j':
+            case 'k':
+            case 'l': {
+                char m[2];
+
+                m[0] = (char)ch;
+                m[1] = '\0';
+                if (was_magic) do_magic(app, m);
+                else do_melee(app, m);
+                break;
+            }
             default: app->count = 0; break;
             }
             continue;
@@ -1246,6 +1641,7 @@ static void update_world_screen(app_t *app)
         case '`':
         case '~': cmd_start(app); return;
         case 'x':
+            if (self_busy(app)) break;
             app->defending = 1;
             app->defend_off_wanted = 0;
             app->count = 0;
@@ -1254,11 +1650,18 @@ static void update_world_screen(app_t *app)
             break;
         case 'z': app->pending_z = 1; break;
         case 'd': app->pending_op = 'd'; break;
-        case '.':                                          /* repeat last melee */
-            if (app->last_kind != 2) { app->count = 0; break; }
+        case 'm': app->pending_op = 'm'; break;
+        case 's':
+            app->book_open = 1;
+            app->book_sel = app->active_spell;
+            app->count = 0;
+            break;
+        case '.':                                  /* repeat last melee or cast */
+            if (app->last_kind != 2 && app->last_kind != 3) { app->count = 0; break; }
             if (app->count > 0) app->last_count = app->count;   /* <count>. overrides */
             app->count = app->last_count;
-            do_melee(app, app->last_motion);
+            if (app->last_kind == 3) do_magic(app, app->last_motion);
+            else do_melee(app, app->last_motion);
             break;
         case ':': cmd_start(app); return;
         case '-':
@@ -1317,8 +1720,17 @@ static void draw_status_bar(app_t *app)
 
         const char *mode = app->defending ? "DEFEND" : "NORMAL";
 
-        snprintf(status, sizeof(status), " %s | %d,%d | %.0fms",
-                 mode, app->self_x, app->self_y, app->rtt_ms);
+        const char *spell = "-";
+
+        if (app->spell_count > 0) spell = app->spells[app->active_spell].name;
+        if (app->challenge_active && strcmp(app->challenge_status, "run") == 0) {
+            snprintf(status, sizeof(status), " %s | %d,%d | %s | %.0fms | %s | %.1fs",
+                     mode, app->self_x, app->self_y, spell, app->rtt_ms,
+                     app->challenge_objective, GetTime() - app->challenge_start);
+        } else {
+            snprintf(status, sizeof(status), " %s | %d,%d | %s | %.0fms",
+                     mode, app->self_x, app->self_y, spell, app->rtt_ms);
+        }
 
         px_text("hp", bx, by, 16, DIM);
         DrawRectangle(bx + 24, by + 4, 84, 8, (Color){ 50, 50, 50, 255 });
@@ -1342,9 +1754,9 @@ static void draw_status_bar(app_t *app)
 
     if (app->screen == SCREEN_WORLD && (app->count > 0 || app->pending_op != 0)) {
         if (app->count > 0 && app->pending_op != 0) {
-            snprintf(count_str, sizeof(count_str), "%dd", app->count);
+            snprintf(count_str, sizeof(count_str), "%d%c", app->count, (char)app->pending_op);
         } else if (app->pending_op != 0) {
-            snprintf(count_str, sizeof(count_str), "d");
+            snprintf(count_str, sizeof(count_str), "%c", (char)app->pending_op);
         } else {
             snprintf(count_str, sizeof(count_str), "%d", app->count);
         }
@@ -1404,6 +1816,28 @@ static void draw_home_screen(app_t *app)
     if (app->error[0] != '\0') {
         px_text(app->error, w / 2 - px_measure(app->error, 18) / 2, y + 40, 18, ERRCOL);
     }
+}
+
+/* the guard covers only the faced side now */
+static void draw_shield(app_t *app, float wx, float wy, char facing, double now_d)
+{
+    float pulse = 1.0f + 0.05f * sinf((float)now_d * 6.0f);
+    float ox = 0.0f;
+    float oz = 0.0f;
+    float w = 0.95f;
+    float d = 0.14f;
+    Vector3 pos;
+
+    (void)app;
+    if (facing == 'l') { ox = 0.55f; w = 0.14f; d = 0.95f; }
+    if (facing == 'h') { ox = -0.55f; w = 0.14f; d = 0.95f; }
+    if (facing == 'j') oz = 0.55f;
+    if (facing == 'k') oz = -0.55f;
+
+    pos = (Vector3){ wx + ox, 0.55f, wy + oz };
+    DrawCube(pos, w * pulse, 1.1f * pulse, d * pulse, Fade((Color){ 130, 160, 220, 255 }, 0.35f));
+    DrawCubeWires(pos, w * pulse, 1.1f * pulse, d * pulse,
+                  Fade((Color){ 170, 200, 250, 255 }, 0.8f));
 }
 
 static float approach(float current, float target, float dt)
@@ -1563,6 +1997,134 @@ static void draw_world_screen(app_t *app)
         }
     }
 
+    /* fire bolts: glowing orbs flying down their line */
+    for (i = 0; i < MAX_BOLTS; i++) {
+        bolt_t *b = &app->bolts[i];
+        float traveled;
+        float bx, bz;
+        int cell;
+        int cx, cy;
+        int k;
+
+        if (!b->used) continue;
+        traveled = (float)(now_d - b->born) * b->speed;
+        if (traveled >= b->range) {
+            b->used = 0;
+            continue;
+        }
+
+        bx = (float)b->x + (float)b->dx * (0.6f + traveled);
+        bz = (float)b->y + (float)b->dy * (0.6f + traveled);
+        cell = (int)(0.6f + traveled + 0.5f);
+        cx = b->x + b->dx * cell;
+        cy = b->y + b->dy * cell;
+
+        if (tile_at(app, cx, cy) != 0) {
+            /* fizzles against the wall */
+            trail_add_burst(app, (float)(b->x + b->dx * (cell - 1)),
+                            (float)(b->y + b->dy * (cell - 1)));
+            b->used = 0;
+            continue;
+        }
+        if (cell > 0 && (occupied(app, cx, cy) || (cx == app->self_x && cy == app->self_y))) {
+            /* bursts on a body; the server confirms the damage */
+            trail_add_burst(app, (float)cx, (float)cy);
+            sound_play(SND_HIT);
+            b->used = 0;
+            continue;
+        }
+
+        for (k = 0; k < 3; k++) {
+            float back = (float)k * 0.45f;
+            float px = bx - (float)b->dx * back;
+            float pz = bz - (float)b->dy * back;
+            float a = k == 0 ? 0.95f : (k == 1 ? 0.4f : 0.15f);
+            float s = 0.3f - 0.06f * (float)k;
+            float flick = 0.9f + 0.2f * sinf((float)now_d * 18.0f + (float)i * 2.0f);
+
+            DrawCube((Vector3){ px, 0.55f, pz }, s * flick, s * flick, s * flick,
+                     Fade((Color){ 255, 200, 90, 255 }, a));
+            DrawCube((Vector3){ px, 0.55f, pz }, s * 0.5f, s * 0.5f, s * 0.5f,
+                     Fade((Color){ 255, 255, 220, 255 }, a));
+        }
+    }
+
+    /* telegraphs: threatened tiles pulse until the strike lands */
+    for (i = 0; i < MAX_TELEGRAPH; i++) {
+        telegraph_t *tg = &app->telegraph[i];
+        float pulse;
+        Color warn;
+        int k;
+
+        if (!tg->used) continue;
+        if (now_d > tg->until + 0.05) {
+            tg->used = 0;
+            continue;
+        }
+        pulse = 0.22f + 0.14f * sinf((float)now_d * 12.0f);
+        if (tg->own) warn = (Color){ 230, 200, 90, 255 };
+        else warn = (Color){ 220, 60, 40, 255 };
+
+        for (k = 1; k <= tg->count; k++) {
+            float px = (float)(tg->x + tg->dx * k);
+            float pz = (float)(tg->y + tg->dy * k);
+
+            DrawCube((Vector3){ px, 0.03f, pz }, 0.85f, 0.02f, 0.85f, Fade(warn, pulse));
+        }
+    }
+
+    /* melee: a black knife flies down the ray, point first */
+    for (i = 0; i < MAX_ATTACK_FX; i++) {
+        attack_fx_t *fx = &app->attack_fx[i];
+        float life;
+        float alpha;
+        float travel;
+        float angle;
+        Color blade;
+        Color handle;
+        int k;
+
+        if (!fx->used) continue;
+        life = ((float)now_d - fx->born) / ATTACK_FX_TTL;
+        if (life >= 1.0f) {
+            fx->used = 0;
+            continue;
+        }
+        if (life < 0.0f) life = 0.0f;
+
+        alpha = 1.0f;
+        if (life > 0.7f) alpha = (1.0f - life) / 0.3f;
+        travel = 1.0f + life * (float)(fx->count - 1);      /* first tile -> last tile */
+
+        angle = 0.0f;                                       /* knife modeled along +x */
+        if (fx->dx < 0) angle = 180.0f;
+        if (fx->dy > 0) angle = -90.0f;
+        if (fx->dy < 0) angle = 90.0f;
+
+        blade = (Color){ 24, 24, 30, 255 };
+        if (fx->own) handle = (Color){ 200, 170, 90, 255 };
+        else handle = (Color){ 190, 60, 50, 255 };
+
+        /* the knife plus one faint motion ghost behind it */
+        for (k = 0; k < 2; k++) {
+            float at = travel - (float)k * 0.55f;
+            float px, pz, a;
+
+            if (at < 1.0f) continue;
+            px = (float)fx->x + (float)fx->dx * at;
+            pz = (float)fx->y + (float)fx->dy * at;
+            a = alpha * (k == 0 ? 1.0f : 0.28f);
+
+            rlPushMatrix();
+            rlTranslatef(px, 0.5f, pz);
+            rlRotatef(angle, 0.0f, 1.0f, 0.0f);
+            DrawCube((Vector3){ 0.08f, 0, 0 }, 0.55f, 0.05f, 0.12f, Fade(blade, a));
+            DrawCube((Vector3){ 0.42f, 0, 0 }, 0.16f, 0.04f, 0.06f, Fade(blade, a));
+            DrawCube((Vector3){ -0.28f, 0, 0 }, 0.18f, 0.07f, 0.08f, Fade(handle, a));
+            rlPopMatrix();
+        }
+    }
+
     /* fire trail: shrinking, rising embers on tiles recently crossed */
     {
         float now = (float)GetTime();
@@ -1617,15 +2179,22 @@ static void draw_world_screen(app_t *app)
     }
 
     for (i = 0; i < MAX_PLAYERS; i++) {
-        if (!app->players[i].used) continue;
-        draw_flame(app->players[i].rx, app->players[i].ry, name_seed(app->players[i].name), 0);
+        player_t *p = &app->players[i];
+        float pmove;
+
+        if (!p->used) continue;
+        pmove = 1.0f - (float)((now_d - p->moved_at) / 0.35);
+        if (pmove < 0.0f) pmove = 0.0f;
+        if (pmove > 1.0f) pmove = 1.0f;
+        if (p->figure == FIG_WISP) {
+            draw_flame(p->rx, p->ry, name_seed(p->name), 0);
+        } else {
+            figures_draw(p->figure, p->rx, p->ry, p->facing, (float)now_d, pmove, 0,
+                         name_seed(p->name));
+        }
         if (app->players[i].defending) {
-            Vector3 pos = { app->players[i].rx, 0.55f, app->players[i].ry };
-            float pulse = 1.0f + 0.04f * sinf((float)now_d * 6.0f);
-            DrawCube(pos, 1.05f * pulse, 1.15f * pulse, 1.05f * pulse,
-                     Fade((Color){ 130, 160, 220, 255 }, 0.22f));
-            DrawCubeWires(pos, 1.05f * pulse, 1.15f * pulse, 1.05f * pulse,
-                          Fade((Color){ 170, 200, 250, 255 }, 0.7f));
+            draw_shield(app, app->players[i].rx, app->players[i].ry,
+                        app->players[i].facing, now_d);
         }
         if (now_d - app->players[i].hit_time < HIT_FLASH) {
             float flash = 1.0f - (float)((now_d - app->players[i].hit_time) / HIT_FLASH);
@@ -1634,14 +2203,16 @@ static void draw_world_screen(app_t *app)
         }
     }
 
-    draw_flame(app->self_rx, app->self_ry, name_seed(app->name), 1);
+    {
+        float smove = 1.0f - (float)((now_d - app->self_moved_at) / 0.35);
+
+        if (smove < 0.0f) smove = 0.0f;
+        if (smove > 1.0f) smove = 1.0f;
+        figures_draw(FIG_HUMAN, app->self_rx, app->self_ry, app->self_facing,
+                     (float)now_d, smove, 1, name_seed(app->name));
+    }
     if (app->defending) {
-        Vector3 pos = { app->self_rx, 0.55f, app->self_ry };
-        float pulse = 1.0f + 0.04f * sinf((float)now_d * 6.0f);
-        DrawCube(pos, 1.05f * pulse, 1.15f * pulse, 1.05f * pulse,
-                 Fade((Color){ 130, 160, 220, 255 }, 0.22f));
-        DrawCubeWires(pos, 1.05f * pulse, 1.15f * pulse, 1.05f * pulse,
-                      Fade((Color){ 170, 200, 250, 255 }, 0.7f));
+        draw_shield(app, app->self_rx, app->self_ry, app->self_facing, now_d);
     }
 
     EndMode3D();
@@ -1707,6 +2278,25 @@ static void draw_world_screen(app_t *app)
         if (hover_name != NULL) draw_name_tag(app, hover_name, hover_rx, hover_ry, hover_col);
     }
 
+    /* own cast bar: gold fills through the windup, grey drains in recovery */
+    if (now_d < app->self_recover_until) {
+        Vector3 above = { app->self_rx, 1.5f, app->self_ry };
+        Vector2 screen = GetWorldToScreen(above, app->camera);
+        float frac;
+        Color fill;
+
+        if (now_d < app->self_windup_until && app->self_windup_len > 0.001) {
+            frac = 1.0f - (float)((app->self_windup_until - now_d) / app->self_windup_len);
+            fill = (Color){ 230, 200, 90, 255 };
+        } else {
+            fill = (Color){ 130, 130, 140, 255 };
+            frac = (float)((app->self_recover_until - now_d) /
+                           (app->self_recover_until - app->self_windup_until + 0.0001));
+        }
+        DrawRectangle((int)screen.x - 16, (int)screen.y - 6, 32, 5, (Color){ 40, 40, 46, 220 });
+        DrawRectangle((int)screen.x - 16, (int)screen.y - 6, (int)(32.0f * frac), 5, fill);
+    }
+
     /* floating -N damage numbers rising and fading from the hit */
     for (i = 0; i < MAX_DMG; i++) {
         dmg_t *d = &app->dmg[i];
@@ -1739,6 +2329,27 @@ static void draw_world_screen(app_t *app)
         draw_text_outlined(text, (int)screen.x - width / 2, (int)screen.y, size, col);
     }
 
+    /* challenge result overlay */
+    if (app->challenge_active && strcmp(app->challenge_status, "run") != 0) {
+        int w = GetScreenWidth();
+        int h = GetScreenHeight();
+        char big[96];
+        char small[64];
+        Color col;
+
+        DrawRectangle(0, 0, w, h, Fade(BG, 0.6f));
+        if (strcmp(app->challenge_status, "won") == 0) {
+            snprintf(big, sizeof(big), "challenge cleared - %.1fs", app->challenge_time);
+            col = ACCENT;
+        } else {
+            snprintf(big, sizeof(big), "you died - %.1fs", app->challenge_time);
+            col = ERRCOL;
+        }
+        snprintf(small, sizeof(small), ":retry to go again");
+        draw_text_outlined(big, w / 2 - px_measure(big, 32) / 2, h / 2 - 40, 32, col);
+        draw_text_outlined(small, w / 2 - px_measure(small, 16) / 2, h / 2 + 8, 16, DIM);
+    }
+
     /* red edge flash when hit */
     if (now_d - app->self_hit_time < HIT_FLASH) {
         float flash = 1.0f - (float)((now_d - app->self_hit_time) / HIT_FLASH);
@@ -1765,6 +2376,31 @@ static void draw_world_screen(app_t *app)
             shown++;
         }
     }
+}
+
+static void draw_spellbook(app_t *app)
+{
+    int w = 300;
+    int h = 60 + app->spell_count * 26;
+    int x = GetScreenWidth() / 2 - w / 2;
+    int y = GetScreenHeight() / 2 - h / 2;
+    int i;
+
+    DrawRectangle(x, y, w, h, (Color){ 16, 16, 22, 240 });
+    DrawRectangleLines(x, y, w, h, (Color){ 90, 90, 110, 255 });
+    px_text("spellbook", x + 12, y + 10, 16, DIM);
+
+    for (i = 0; i < app->spell_count; i++) {
+        spell_t *sp = &app->spells[i];
+        char line[96];
+        Color col = (i == app->book_sel) ? ACCENT : FG;
+        const char *mark = (i == app->active_spell) ? "*" : " ";
+
+        snprintf(line, sizeof(line), "%s %s   %.0fst/pt  spd %.0f  rng %.0f",
+                 mark, sp->name, sp->cost, sp->speed, sp->range);
+        px_text(line, x + 12, y + 40 + i * 26, 16, col);
+    }
+    px_text("j/k move, enter select, esc close", x + 12, y + h - 22, 16, DIM);
 }
 
 static void draw_console(app_t *app)
@@ -1810,6 +2446,7 @@ int main(void)
     memset(&app, 0, sizeof(app));
     app.conn = CONN_IDLE;
     app.hist_nav = -1;
+    app.self_facing = 'j';
     snprintf(app.address, sizeof(app.address), DEFAULT_ADDRESS);
     app.comp_idx = -1;
     if (config_load(&app)) app.screen = SCREEN_HOME;
@@ -1872,6 +2509,7 @@ int main(void)
         case SCREEN_HOME: draw_home_screen(&app); break;
         case SCREEN_WORLD: draw_world_screen(&app); break;
         }
+        if (app.screen == SCREEN_WORLD && app.book_open) draw_spellbook(&app);
         if (app.console_open) draw_console(&app);
         draw_status_bar(&app);
         EndDrawing();

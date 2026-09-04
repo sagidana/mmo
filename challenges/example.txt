@@ -1,0 +1,30 @@
+; example challenge — run with:
+;   python3 -m server.main --challenge challenges/example.txt
+;
+; sections: [rules] override server tuning, [player] sets entry vitals,
+; [npcs] is "kind x,y hp=N damage=N" (kinds: dummy, walker, chaser),
+; [objective] is kill_all | survive <seconds> | reach <x,y>,
+; [map] is the ascii world (. floor, # wall, S spawn) and must be last.
+
+[player]
+hp = 60
+
+[npcs]
+dummy  8,3   hp=20
+dummy  12,3  hp=20
+chaser 16,8  hp=40 damage=8
+
+[objective]
+kill_all
+
+[map]
+####################
+#S.................#
+#..................#
+#..................#
+#......####........#
+#......#..#........#
+#......####........#
+#..................#
+#..................#
+####################

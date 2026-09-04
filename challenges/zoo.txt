@@ -1,0 +1,27 @@
+; the zoo — every figure asset on display, nothing fights back.
+; walk the line, look at the creatures, reach the far corner to "win".
+;   python3 -m server.main --challenge challenges/zoo.txt
+
+[npcs]
+dummy 4,2   hp=999 figure=slime
+dummy 7,2   hp=999 figure=rat
+dummy 10,2  hp=999 figure=spider
+dummy 13,2  hp=999 figure=golem
+dummy 16,2  hp=999 figure=skeleton
+dummy 19,2  hp=999 figure=hound
+dummy 22,2  hp=999 figure=crab
+dummy 25,2  hp=999 figure=watcher
+dummy 28,2  hp=999 figure=worm
+dummy 31,2  hp=999 figure=wisp
+dummy 34,2  hp=999 figure=human
+
+[objective]
+reach 36,4
+
+[map]
+######################################
+#....................................#
+#S...................................#
+#....................................#
+#....................................#
+######################################
