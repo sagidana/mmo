@@ -266,7 +266,43 @@ the path takes `count` damage (directional guard applies), no pierce, and
 they fizzle at max range. Clients animate the flight locally from the
 single `bolt` event — a dodging target simply isn't there when it arrives.
 
-firebolt: cost 3/pt, speed 9 tiles/s, range 15, windup 0.04s/pt.
+firebolt: cost 3/pt, speed 9 tiles/s, range 15, windup 0.04s/pt, no recovery.
+
+Tile-targeted spells (`"targeting": "tile"` in the catalog) cast at a mark
+instead of a motion — the intent carries `tx`/`ty` (chebyshev distance <=
+the spell's `range`, floor tiles only). After the wind-up the strike is
+scheduled `delay_base + delay_per * count` seconds out and announced:
+
+```
+c->s  {"type": "intent", "seq": 9, "data": {"op": "magic", "count": 10, "tx": 14, "ty": 7}}
+s->c  {"type": "missile", "data": {"by": "sagi", "sx": 10, "sy": 7,
+                                   "x": 14, "y": 7, "count": 10, "eta": 1.4}}
+```
+
+At impact, whoever stands on the mark takes `count` damage — shields do
+not block falling fire; the only defence is not being there. The mark is
+visible to everyone for the whole flight.
+
+firemissile: cost 4/pt, target range 7, delay 0.6 + 0.08/pt.
+
+## the dot register (server-side)
+
+The server records every committed offensive action (melee, cast, or
+missile — the mark stored as an offset from the caster) into a per-session
+register. Three wire forms:
+
+```
+c->s  {"type": "intent", "seq": 9, "data": {"op": "melee", "motion": "l",
+                                            "count": 9, "load": true}}    <- arm only: free, no windup
+c->s  {"type": "intent", "seq": 10, "data": {"op": "repeat"}}             <- fire the register
+c->s  {"type": "intent", "seq": 11, "data": {"op": "repeat", "count": 2}} <- override; the override sticks
+```
+
+Repeats run the stored action through the full normal pipeline (stamina,
+busy gates, wind-up, telegraphs) using the spell stored at record time,
+not the currently active one; missile marks are re-applied relative to
+the caster's current position. Empty register: granted 0. Windup events
+carry `"op"` so clients can drive cast bars for repeated actions.
 
 # Protocol — Challenge mode
 

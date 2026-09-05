@@ -75,6 +75,37 @@ char *proto_spell(int seq, const char *spell)
     return envelope("spell", seq, data);
 }
 
+char *proto_repeat(int seq, int count)
+{
+    cJSON *data = cJSON_CreateObject();
+
+    cJSON_AddStringToObject(data, "op", "repeat");
+    if (count > 0) cJSON_AddNumberToObject(data, "count", count);
+    return envelope("intent", seq, data);
+}
+
+char *proto_intent_load(int seq, const char *op, const char *motion, int count)
+{
+    cJSON *data = cJSON_CreateObject();
+
+    cJSON_AddStringToObject(data, "op", op);
+    cJSON_AddStringToObject(data, "motion", motion);
+    cJSON_AddNumberToObject(data, "count", count);
+    cJSON_AddBoolToObject(data, "load", 1);
+    return envelope("intent", seq, data);
+}
+
+char *proto_intent_tile(int seq, int count, int tx, int ty)
+{
+    cJSON *data = cJSON_CreateObject();
+
+    cJSON_AddStringToObject(data, "op", "magic");
+    cJSON_AddNumberToObject(data, "count", count);
+    cJSON_AddNumberToObject(data, "tx", tx);
+    cJSON_AddNumberToObject(data, "ty", ty);
+    return envelope("intent", seq, data);
+}
+
 int proto_parse(const char *raw, proto_msg_t *msg)
 {
     cJSON *root = cJSON_Parse(raw);

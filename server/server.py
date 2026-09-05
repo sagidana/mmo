@@ -42,12 +42,24 @@ RULES['recover_max'] = 0.6
 SPELLS = []
 FIREBOLT = {}
 FIREBOLT['name'] = 'firebolt'
+FIREBOLT['targeting'] = 'ray'
 FIREBOLT['cost'] = 3
 FIREBOLT['speed'] = 9.0
 FIREBOLT['range'] = 15
 FIREBOLT['windup'] = 0.04
-FIREBOLT['recover'] = 0.02
+FIREBOLT['recover'] = 0.0    # once loosed, the caster is free
 SPELLS.append(FIREBOLT)
+
+FIREMISSILE = {}
+FIREMISSILE['name'] = 'firemissile'
+FIREMISSILE['targeting'] = 'tile'
+FIREMISSILE['cost'] = 4
+FIREMISSILE['range'] = 7          # chebyshev reach of the target cursor
+FIREMISSILE['windup'] = 0.02
+FIREMISSILE['recover'] = 0.0
+FIREMISSILE['delay_base'] = 0.6   # sky time before impact
+FIREMISSILE['delay_per'] = 0.08   # per power point: heavier falls later
+SPELLS.append(FIREMISSILE)
 
 SPELL_INDEX = {}
 for _spell in SPELLS:
@@ -92,6 +104,7 @@ class Session():
         self.pending = None
         self.recover_until = 0.0
         self.active_spell = SPELLS[0]['name']
+        self.dot = None    # server-side dot register: the last offensive action
 
     @property
     def name(self):
@@ -171,6 +184,7 @@ class Instance():
         self.dirty = {}
         self.gone = []
         self.bolts = []
+        self.missiles = []
         self.status = 'running'
         self.start_time = time.time()
 
@@ -651,6 +665,11 @@ class Server():
 
         session.stamina -= pool * RULES['melee_cost']    # the swing is committed, hit or whiff
         session.facing = motion
+        dot = {}
+        dot['op'] = 'melee'
+        dot['motion'] = motion
+        dot['count'] = count
+        session.dot = dot
 
         windup = min(pool * RULES['melee_windup'], RULES['windup_max'])
         pending = {}
@@ -662,6 +681,7 @@ class Server():
 
         wind_data = {}
         wind_data['by'] = session.name
+        wind_data['op'] = 'melee'
         wind_data['motion'] = motion
         wind_data['count'] = pool
         wind_data['x'] = session.x
@@ -735,6 +755,12 @@ class Server():
                 recover = min(pending['pool'] * spell['recover'], RULES['recover_max'])
                 member.recover_until = now + recover
                 self.launch_bolt(member, pending['motion'], pending['pool'], pending['spell'])
+            elif pending['kind'] == 'magic_tile':
+                spell = SPELL_INDEX[pending['spell']]
+                recover = min(pending['pool'] * spell['recover'], RULES['recover_max'])
+                member.recover_until = now + recover
+                self.launch_missile(member, pending['tx'], pending['ty'],
+                                    pending['pool'], pending['spell'])
             elif pending['kind'] == 'bite':
                 dx, dy = MOTIONS[pending['motion']]
                 occupied = self.occupied_members(instance, exclude=member.name)
@@ -751,18 +777,90 @@ class Server():
                 if target is not None and not target.is_npc:
                     self.strike(target, member.damage, member.name, ray_dir=pending['motion'])
 
+    def do_repeat(self, session, seq, data):
+        dot = session.dot
+        if dot is None:
+            self.intent_reply(session, seq, 0)
+            return
+
+        override = data.get('count')
+        good = isinstance(override, int) and not isinstance(override, bool)
+        if good and 1 <= override <= MAX_COUNT: dot['count'] = override    # sticks, vim-style
+
+        if dot['op'] == 'melee':
+            self.do_melee(session, seq, dot['motion'], dot['count'])
+        elif dot['op'] == 'magic':
+            self.do_magic(session, seq, dot['motion'], dot['count'], spell_name=dot['spell'])
+        elif dot['op'] == 'magic_tile':
+            if session.instance.status != 'running' or session.defending or self.busy(session):
+                self.intent_reply(session, seq, 0)
+                return
+            target = {}
+            target['tx'] = session.x + dot['dx']    # the mark walks with you
+            target['ty'] = session.y + dot['dy']
+            self.do_magic_tile(session, seq, target, dot['count'], SPELL_INDEX[dot['spell']])
+
+    def load_dot(self, session, seq, op, motion, count, data):
+        # arm the register without firing: validated, but free and instant
+        dot = {}
+        dot['count'] = count
+        if op == 'melee':
+            dot['op'] = 'melee'
+            dot['motion'] = motion
+        else:
+            spell = SPELL_INDEX[session.active_spell]
+            if spell.get('targeting') == 'tile':
+                tx = data.get('tx')
+                ty = data.get('ty')
+                ok = isinstance(tx, int) and isinstance(ty, int)
+                ok = ok and not isinstance(tx, bool) and not isinstance(ty, bool)
+                if not ok:
+                    session.send(protocol.error(seq, 'bad_request', "tile spell needs tx/ty"))
+                    return
+                dot['op'] = 'magic_tile'
+                dot['dx'] = tx - session.x
+                dot['dy'] = ty - session.y
+            else:
+                dot['op'] = 'magic'
+                dot['motion'] = motion
+            dot['spell'] = spell['name']
+        session.dot = dot
+        self.intent_reply(session, seq, count)
+
     async def on_intent(self, session, seq, data):
         if session.state != AUTHED:
             session.send(protocol.error(seq, 'bad_state', "auth first"))
             return
 
         op = data.get('op')
-        ops = ('move', 'melee', 'defend', 'magic', 'face')
+        ops = ('move', 'melee', 'defend', 'magic', 'face', 'repeat')
         if op not in ops:
             session.send(protocol.error(seq, 'bad_request', f"unknown op: {op}"))
             return
 
+        if op == 'repeat':
+            self.do_repeat(session, seq, data)
+            return
+
+        load = data.get('load') is True
         motion = data.get('motion')
+        if op == 'magic':
+            spell = SPELL_INDEX[session.active_spell]
+            if spell.get('targeting') == 'tile':
+                count = data.get('count', 1)
+                bad = isinstance(count, bool) or not isinstance(count, int)
+                if bad or count < 1 or count > MAX_COUNT:
+                    session.send(protocol.error(seq, 'bad_request', "count must be 1..4096"))
+                    return
+                if load:
+                    self.load_dot(session, seq, op, motion, count, data)
+                    return
+                if session.instance.status != 'running' or session.defending or self.busy(session):
+                    self.intent_reply(session, seq, 0)
+                    return
+                self.do_magic_tile(session, seq, data, count, spell)
+                return
+
         if op == 'defend':
             if motion != 'on' and motion != 'off':
                 session.send(protocol.error(seq, 'bad_request', "defend motion must be on/off"))
@@ -778,6 +876,10 @@ class Server():
         count = data.get('count', 1)
         if isinstance(count, bool) or not isinstance(count, int) or count < 1 or count > MAX_COUNT:
             session.send(protocol.error(seq, 'bad_request', "count must be 1..4096"))
+            return
+
+        if load and (op == 'melee' or op == 'magic'):
+            self.load_dot(session, seq, op, motion, count, data)
             return
 
         if op == 'move':
@@ -823,6 +925,7 @@ class Server():
         instance.dirty = {}
         instance.gone = []
         instance.bolts = []
+        instance.missiles = []
         instance.status = 'running'
         instance.start_time = time.time()
 
@@ -861,12 +964,13 @@ class Server():
         reply_data['spell'] = name
         session.send(protocol.reply('spell_ok', seq, reply_data))
 
-    def do_magic(self, session, seq, motion, count):
+    def do_magic(self, session, seq, motion, count, spell_name=None):
         if session.instance.status != 'running' or session.defending or self.busy(session):
             self.intent_reply(session, seq, 0)
             return
 
-        spell = SPELL_INDEX[session.active_spell]
+        if spell_name is None: spell_name = session.active_spell
+        spell = SPELL_INDEX[spell_name]
         affordable = int(session.stamina // spell['cost'])
         pool = min(count, affordable)
         if pool <= 0:
@@ -875,6 +979,12 @@ class Server():
 
         session.stamina -= pool * spell['cost']
         session.facing = motion
+        dot = {}
+        dot['op'] = 'magic'
+        dot['motion'] = motion
+        dot['count'] = count
+        dot['spell'] = spell['name']
+        session.dot = dot
 
         windup = min(pool * spell['windup'], RULES['windup_max'])
         pending = {}
@@ -887,6 +997,7 @@ class Server():
 
         wind_data = {}
         wind_data['by'] = session.name
+        wind_data['op'] = 'magic'
         wind_data['motion'] = motion
         wind_data['count'] = spell['range']    # the aim line, not the pool
         wind_data['x'] = session.x
@@ -895,6 +1006,85 @@ class Server():
         self.instance_send(session.instance, protocol.event('windup', wind_data))
 
         self.intent_reply(session, seq, pool)
+
+    def do_magic_tile(self, session, seq, data, count, spell):
+        tx = data.get('tx')
+        ty = data.get('ty')
+        ok = isinstance(tx, int) and isinstance(ty, int)
+        ok = ok and not isinstance(tx, bool) and not isinstance(ty, bool)
+        if not ok:
+            session.send(protocol.error(seq, 'bad_request', "tile spell needs tx/ty"))
+            return
+        if max(abs(tx - session.x), abs(ty - session.y)) > spell['range']:
+            session.send(protocol.error(seq, 'bad_request', "target out of range"))
+            return
+        if session.instance.world.tile(tx, ty) != 0:
+            session.send(protocol.error(seq, 'bad_request', "target is a wall"))
+            return
+
+        affordable = int(session.stamina // spell['cost'])
+        pool = min(count, affordable)
+        if pool <= 0:
+            self.intent_reply(session, seq, 0)
+            return
+
+        session.stamina -= pool * spell['cost']
+        dot = {}
+        dot['op'] = 'magic_tile'
+        dot['dx'] = tx - session.x
+        dot['dy'] = ty - session.y
+        dot['count'] = count
+        dot['spell'] = spell['name']
+        session.dot = dot
+
+        windup = min(pool * spell['windup'], RULES['windup_max'])
+        pending = {}
+        pending['kind'] = 'magic_tile'
+        pending['tx'] = tx
+        pending['ty'] = ty
+        pending['pool'] = pool
+        pending['spell'] = spell['name']
+        pending['at'] = time.time() + windup
+        session.pending = pending
+        self.intent_reply(session, seq, pool)
+
+    def launch_missile(self, member, tx, ty, pool, spell_name):
+        spell = SPELL_INDEX[spell_name]
+        eta = spell['delay_base'] + spell['delay_per'] * pool
+
+        missile = {}
+        missile['by'] = member.name
+        missile['x'] = tx
+        missile['y'] = ty
+        missile['damage'] = float(pool)
+        missile['at'] = time.time() + eta
+        member.instance.missiles.append(missile)
+
+        missile_data = {}
+        missile_data['by'] = member.name
+        missile_data['sx'] = member.x
+        missile_data['sy'] = member.y
+        missile_data['x'] = tx
+        missile_data['y'] = ty
+        missile_data['count'] = pool
+        missile_data['eta'] = round(eta, 2)
+        self.instance_send(member.instance, protocol.event('missile', missile_data))
+
+    def impact_missiles(self, instance):
+        if len(instance.missiles) == 0: return
+        now = time.time()
+
+        remaining = []
+        for missile in instance.missiles:
+            if now < missile['at']:
+                remaining.append(missile)
+                continue
+            # falling fire ignores shields: whoever stands on the mark burns
+            occupied = self.occupied_members(instance)
+            target = occupied.get((missile['x'], missile['y']))
+            if target is not None:
+                self.apply_damage(target, min(missile['damage'], target.hp), missile['by'])
+        instance.missiles = remaining
 
     def launch_bolt(self, member, motion, pool, spell_name):
         spell = SPELL_INDEX[spell_name]
@@ -1290,6 +1480,7 @@ class Server():
                 self.act_npcs(instance)
                 self.resolve_pending(instance)
                 self.advance_bolts(instance)
+                self.impact_missiles(instance)
                 self.check_objective(instance)
                 self.flush_instance(instance)
 

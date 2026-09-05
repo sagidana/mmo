@@ -87,8 +87,12 @@ d{motion}      melee attack (count = damage pool: 5dl)
 x              raise guard (blocks the faced direction; esc or x releases)
 ctrl-hjkl      turn in place (aim / steer the guard)
 m{motion}      cast the active spell (count = power: 8ml)
+               tile spells (fire missile) open an aim cursor instead:
+               hjkl+counts move it, enter drops the mark, esc cancels
 s              open the spellbook (j/k, enter selects)
-.              repeat last melee
+d/m + ctrl-dir  arm the action into . without firing (100m ctrl-l)
+.              fire the register (server-side: last/armed melee, cast,
+               or missile — missiles re-aim relative to where you stand)
 esc            clear pending count / operator
 zz / zZ        center screen vertically / both axes
 zh zl zk zj    view the area left / right / above / below

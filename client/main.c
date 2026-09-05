@@ -163,7 +163,20 @@ typedef struct {
     float range;
     float windup;
     float recover;
+    int is_tile;           /* tile-targeted (missile) vs ray (bolt) */
 } spell_t;
+
+typedef struct {
+    int used;
+    int played_impact;
+    int sx;                /* caster */
+    int sy;
+    int x;                 /* the marked tile */
+    int y;
+    double born;
+    double impact_at;
+    int own;
+} missile_t;
 
 typedef struct {
     int used;
@@ -218,6 +231,12 @@ typedef struct {
     int telegraph_next;
     bolt_t bolts[MAX_BOLTS];
     int bolt_next;
+    missile_t missiles[MAX_BOLTS];
+    int missile_next;
+    int target_active;               /* tile-selection view */
+    int target_x;
+    int target_y;
+    int target_power;
     spell_t spells[MAX_SPELLS];
     int spell_count;
     int active_spell;                /* index; server confirms via spell_ok */
@@ -259,9 +278,6 @@ typedef struct {
     int count;                       /* pending count prefix, 0 = none */
     int pending_z;                   /* saw 'z', waiting for second key */
     int pending_op;                  /* 'd' waiting for its motion, 0 = none */
-    int last_kind;                   /* dot-repeat: 0 none, 2 melee, 3 magic */
-    char last_motion[2];
-    int last_count;
     char cmd[128];                   /* console prompt line */
     char cmd_history[MAX_HISTORY][128];
     int hist_count;
@@ -608,7 +624,6 @@ static void disconnect(app_t *app, const char *why)
     app->count = 0;
     app->pending_z = 0;
     app->pending_op = 0;
-    app->last_kind = 0;
     app->defending = 0;
     app->defend_off_wanted = 0;
     app->challenge_active = 0;
@@ -621,7 +636,9 @@ static void disconnect(app_t *app, const char *why)
     for (i = 0; i < MAX_ATTACK_FX; i++) app->attack_fx[i].used = 0;
     for (i = 0; i < MAX_TELEGRAPH; i++) app->telegraph[i].used = 0;
     for (i = 0; i < MAX_BOLTS; i++) app->bolts[i].used = 0;
+    for (i = 0; i < MAX_BOLTS; i++) app->missiles[i].used = 0;
     app->book_open = 0;
+    app->target_active = 0;
     app->self_windup_until = 0;
     app->self_recover_until = 0;
     app->event_head = 0;
@@ -872,6 +889,11 @@ static void handle_message(app_t *app, const char *raw)
                 if (cJSON_IsNumber(sname)) sp->windup = (float)sname->valuedouble;
                 sname = cJSON_GetObjectItem(entry, "recover");
                 if (cJSON_IsNumber(sname)) sp->recover = (float)sname->valuedouble;
+                sp->is_tile = 0;
+                sname = cJSON_GetObjectItem(entry, "targeting");
+                if (cJSON_IsString(sname) && strcmp(sname->valuestring, "tile") == 0) {
+                    sp->is_tile = 1;
+                }
                 if (strcmp(sp->name, active) == 0) app->active_spell = app->spell_count;
                 app->spell_count++;
             }
@@ -930,6 +952,18 @@ static void handle_message(app_t *app, const char *raw)
         player_t *pb = player_find(app, by);
 
         if (pb != NULL) pb->facing = mo[0];
+        if (strcmp(by, app->name) == 0) {
+            double strike_in = proto_data_num(&msg, "strike_in", 0.2);
+            float rec = 0.0f;
+
+            if (strcmp(proto_data_str(&msg, "op", ""), "melee") == 0) {
+                rec = (float)proto_data_num(&msg, "count", 1) * app->melee_recover;
+                if (rec > app->recover_max) rec = app->recover_max;
+            }
+            app->self_windup_until = GetTime() + strike_in;
+            app->self_windup_len = strike_in;
+            app->self_recover_until = app->self_windup_until + rec;
+        }
         app->telegraph_next = (app->telegraph_next + 1) % MAX_TELEGRAPH;
         tg->used = 1;
         tg->x = (int)proto_data_num(&msg, "x", 0);
@@ -1044,6 +1078,20 @@ static void handle_message(app_t *app, const char *raw)
         b->range = (float)proto_data_num(&msg, "range", 15);
         b->born = GetTime();
         b->own = strcmp(by, app->name) == 0;
+        sound_play(SND_SWING);
+    } else if (strcmp(msg.type, "missile") == 0) {
+        missile_t *ms = &app->missiles[app->missile_next];
+
+        app->missile_next = (app->missile_next + 1) % MAX_BOLTS;
+        ms->used = 1;
+        ms->played_impact = 0;
+        ms->sx = (int)proto_data_num(&msg, "sx", 0);
+        ms->sy = (int)proto_data_num(&msg, "sy", 0);
+        ms->x = (int)proto_data_num(&msg, "x", 0);
+        ms->y = (int)proto_data_num(&msg, "y", 0);
+        ms->born = GetTime();
+        ms->impact_at = ms->born + proto_data_num(&msg, "eta", 1.0);
+        ms->own = strcmp(proto_data_str(&msg, "by", "?"), app->name) == 0;
         sound_play(SND_SWING);
     } else if (strcmp(msg.type, "pong") == 0) {
         app->rtt_ms = GetTime() * 1000.0 - proto_data_num(&msg, "t", 0);
@@ -1356,14 +1404,6 @@ static void update_home_screen(app_t *app)
 
 /* ---------------- input: world ---------------- */
 
-static void record_op(app_t *app, int kind, const char *motion, int count)
-{
-    app->last_kind = kind;
-    app->last_motion[0] = motion[0];
-    app->last_motion[1] = '\0';
-    app->last_count = count;
-}
-
 static void do_move(app_t *app, int dx, int dy, const char *motion, int mult)
 {
     int count = app->count;
@@ -1418,7 +1458,6 @@ static void do_melee(app_t *app, const char *motion)
 
     if (count == 0) count = 1;
     app->count = 0;
-    record_op(app, 2, motion, count);
     if (self_busy(app)) return;
 
     if (motion[0] == 'h' || motion[0] == 'j' || motion[0] == 'k' || motion[0] == 'l') {
@@ -1464,7 +1503,6 @@ static void do_magic(app_t *app, const char *motion)
 
     if (count == 0) count = 1;
     app->count = 0;
-    record_op(app, 3, motion, count);
     if (self_busy(app)) return;
     if (app->spell_count == 0) return;
     sp = &app->spells[app->active_spell];
@@ -1518,7 +1556,64 @@ static void update_world_screen(app_t *app)
         return;
     }
 
-    /* ctrl-hjkl: turn in place (steers the guard too) */
+    /* tile-selection view: aim the missile, enter drops the mark */
+    if (app->target_active) {
+        spell_t *sp = &app->spells[app->active_spell];
+        int r = (int)sp->range;
+        int step;
+
+        for (;;) {
+            ch = GetCharPressed();
+            if (ch == 0) break;
+            if (ch >= '1' && ch <= '9') {
+                app->count = app->count * 10 + (ch - '0');
+                continue;
+            }
+            if (ch == '0' && app->count > 0) {
+                app->count = app->count * 10;
+                continue;
+            }
+            step = app->count == 0 ? 1 : app->count;
+            app->count = 0;
+            if (ch == 'h') app->target_x -= step;
+            else if (ch == 'l') app->target_x += step;
+            else if (ch == 'k') app->target_y -= step;
+            else if (ch == 'j') app->target_y += step;
+
+            if (app->target_x < app->self_x - r) app->target_x = app->self_x - r;
+            if (app->target_x > app->self_x + r) app->target_x = app->self_x + r;
+            if (app->target_y < app->self_y - r) app->target_y = app->self_y - r;
+            if (app->target_y > app->self_y + r) app->target_y = app->self_y + r;
+        }
+        if (IsKeyPressed(KEY_ESCAPE)) {
+            app->target_active = 0;
+            app->count = 0;
+        }
+        if (IsKeyPressed(KEY_ENTER)) {
+            app->target_active = 0;
+            app->count = 0;
+            app->seq++;
+            app->outstanding++;
+            send_raw(app, proto_intent_tile(app->seq, app->target_power,
+                                            app->target_x, app->target_y));
+            /* client-side commitment mirror: short cast lock */
+            {
+                float windup = (float)app->target_power * sp->windup;
+
+                if (windup > app->windup_max) windup = app->windup_max;
+                app->self_windup_until = GetTime() + windup;
+                app->self_recover_until = app->self_windup_until;
+                app->self_windup_len = windup;
+                app->stamina -= (float)app->target_power * sp->cost;
+                if (app->stamina < 0) app->stamina = 0;
+            }
+        }
+        return;
+    }
+
+    /* ctrl-hjkl: with a pending operator it ARMS the dot register without
+     * firing (100m ctrl-l loads "cast 100 right" into `.`); otherwise it
+     * turns in place (steers the guard too) */
     if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) {
         char face = 0;
 
@@ -1526,7 +1621,23 @@ static void update_world_screen(app_t *app)
         if (IsKeyPressed(KEY_J)) face = 'j';
         if (IsKeyPressed(KEY_K)) face = 'k';
         if (IsKeyPressed(KEY_L)) face = 'l';
-        if (face != 0 && !self_busy(app)) {
+        if (face != 0 && (app->pending_op == 'd' || app->pending_op == 'm')) {
+            char m[2];
+            char loaded[64];
+            int c = app->count == 0 ? 1 : app->count;
+            const char *opname = app->pending_op == 'm' ? "magic" : "melee";
+
+            m[0] = face;
+            m[1] = '\0';
+            app->seq++;
+            app->outstanding++;
+            send_raw(app, proto_intent_load(app->seq, opname, m, c));
+            snprintf(loaded, sizeof(loaded), "loaded: %d%c%c (fire with .)",
+                     c, (char)app->pending_op, face);
+            log_line(app, loaded);
+            app->pending_op = 0;
+            app->count = 0;
+        } else if (face != 0 && !self_busy(app)) {
             char m[2];
 
             m[0] = face;
@@ -1650,19 +1761,32 @@ static void update_world_screen(app_t *app)
             break;
         case 'z': app->pending_z = 1; break;
         case 'd': app->pending_op = 'd'; break;
-        case 'm': app->pending_op = 'm'; break;
+        case 'm':
+            if (app->spell_count > 0 && app->spells[app->active_spell].is_tile) {
+                if (self_busy(app)) { app->count = 0; break; }
+                app->target_active = 1;
+                app->target_x = app->self_x;
+                app->target_y = app->self_y;
+                app->target_power = app->count == 0 ? 1 : app->count;
+                app->count = 0;
+            } else {
+                app->pending_op = 'm';
+            }
+            break;
         case 's':
             app->book_open = 1;
             app->book_sel = app->active_spell;
             app->count = 0;
             break;
-        case '.':                                  /* repeat last melee or cast */
-            if (app->last_kind != 2 && app->last_kind != 3) { app->count = 0; break; }
-            if (app->count > 0) app->last_count = app->count;   /* <count>. overrides */
-            app->count = app->last_count;
-            if (app->last_kind == 3) do_magic(app, app->last_motion);
-            else do_melee(app, app->last_motion);
+        case '.': {                        /* the dot register lives server-side */
+            int override = app->count;
+
+            app->count = 0;
+            app->seq++;
+            app->outstanding++;
+            send_raw(app, proto_repeat(app->seq, override));
             break;
+        }
         case ':': cmd_start(app); return;
         case '-':
             app->cam_dist += 2.0f;
@@ -1994,6 +2118,66 @@ static void draw_world_screen(app_t *app)
                 pos.y = 0.92f;
                 DrawCube(pos, 0.94f, 0.06f, 0.94f, (Color){ 88, 88, 98, 255 });
             }
+        }
+    }
+
+    /* tile-selection view: reachable square + the aim cursor */
+    if (app->target_active && app->spell_count > 0) {
+        spell_t *sp = &app->spells[app->active_spell];
+        int r = (int)sp->range;
+        int tx, ty;
+        float pulse = 0.5f + 0.2f * sinf((float)now_d * 8.0f);
+
+        for (ty = app->self_y - r; ty <= app->self_y + r; ty++) {
+            for (tx = app->self_x - r; tx <= app->self_x + r; tx++) {
+                if (tile_at(app, tx, ty) != 0) continue;
+                DrawCube((Vector3){ (float)tx, 0.02f, (float)ty }, 0.9f, 0.01f, 0.9f,
+                         Fade((Color){ 240, 180, 80, 255 }, 0.07f));
+            }
+        }
+        DrawCube((Vector3){ (float)app->target_x, 0.04f, (float)app->target_y },
+                 0.9f, 0.02f, 0.9f, Fade((Color){ 255, 170, 60, 255 }, pulse));
+        DrawCubeWires((Vector3){ (float)app->target_x, 0.3f, (float)app->target_y },
+                      0.95f, 0.6f, 0.95f, Fade((Color){ 255, 200, 90, 255 }, 0.9f));
+    }
+
+    /* missiles: rising launch, burning mark, then the strike falls */
+    for (i = 0; i < MAX_BOLTS; i++) {
+        missile_t *ms = &app->missiles[i];
+        double left;
+        float pulse;
+
+        if (!ms->used) continue;
+        left = ms->impact_at - now_d;
+        if (left <= 0) {
+            if (!ms->played_impact) {
+                trail_add_burst(app, (float)ms->x, (float)ms->y);
+                sound_play(SND_HIT);
+            }
+            ms->used = 0;
+            continue;
+        }
+
+        /* the mark burns until impact, pulsing faster as it nears */
+        pulse = 0.25f + 0.2f * sinf((float)now_d * (6.0f + 30.0f / (float)(left + 0.3)));
+        DrawCube((Vector3){ (float)ms->x, 0.03f, (float)ms->y }, 0.85f, 0.02f, 0.85f,
+                 Fade((Color){ 230, 70, 40, 255 }, pulse));
+
+        /* launch: a flame streaks up from the caster */
+        if (now_d - ms->born < 0.45) {
+            float up = (float)((now_d - ms->born) / 0.45) * 7.0f;
+
+            DrawCube((Vector3){ (float)ms->sx, 0.5f + up, (float)ms->sy }, 0.25f, 0.5f, 0.25f,
+                     Fade((Color){ 255, 190, 80, 255 }, 0.9f));
+        }
+        /* the fall: fire comes down on the mark */
+        if (left < 0.45) {
+            float down = 0.3f + (float)(left / 0.45) * 7.0f;
+
+            DrawCube((Vector3){ (float)ms->x, down, (float)ms->y }, 0.3f, 0.6f, 0.3f,
+                     (Color){ 255, 160, 60, 255 });
+            DrawCube((Vector3){ (float)ms->x, down, (float)ms->y }, 0.16f, 0.4f, 0.16f,
+                     (Color){ 255, 240, 190, 255 });
         }
     }
 
